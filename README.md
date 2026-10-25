@@ -20,7 +20,9 @@ uv installs Python 3.12 and the locked dependencies automatically. You do not ne
 
 The default installation uses CPU PyTorch wheels on Windows and Linux. On Apple Silicon, PyTorch includes MPS support; the app selects it when available. NVIDIA support is optional below. Java, DeepSpeed, a CUDA Toolkit installation and manual eSpeak installation are not required by the default setup. The English tokenizer is installed with the app; Kokoro downloads its model and selected voices on first synthesis, so that first run needs internet access.
 
-The desktop interface needs Tk. If Python reports `No module named tkinter`, install a Python build with Tk support or your distribution's Python Tk package. The command line can run without a display.
+The desktop app opens in its own window through [pywebview](https://pywebview.flowrl.com/), which uses the system web view: WebKit on macOS and WebView2 on Windows 10/11 (included with the system). On Linux, install WebKitGTK and PyGObject first, for example `sudo apt install gir1.2-webkit2-4.1 python3-gi` on Debian or Ubuntu. The command line can run without a display.
+
+The app keeps a library of your books in `~/Audiobooks/PDF Narrator` (you can change it in Settings). Each book has its own folder with the extracted text, chapter audio and exports. The original file you import is copied and never modified.
 
 ## Command line
 
@@ -33,7 +35,7 @@ uv run pdf-narrator book.epub --resume
 uv run pdf-narrator --help
 ```
 
-With no input argument, `pdf-narrator` opens the desktop interface. `uv run main.py` remains available.
+With no input argument, `pdf-narrator` opens the desktop app. `uv run pdf-narrator --ui classic` opens the previous Tk window, which needs a Python build with Tk support.
 
 - Inputs: `.pdf`, `.epub`, `.txt`, `.html`, `.htm`, or a directory of extracted `.txt` chapters.
 - Outputs: WAV by default, MP3, or M4B with chapter markers and EPUB metadata when present.

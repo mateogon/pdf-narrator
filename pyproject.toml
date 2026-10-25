@@ -25,6 +25,7 @@ dependencies = [
     "soundfile>=0.13,<1",
     "torch>=2.6,<3",
     "ttkbootstrap>=1.10,<2",
+    "pywebview>=6.2,<7",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +40,11 @@ cpu = ["torch>=2.6,<3"]
 dev = ["pytest>=8,<10"]
 
 [tool.setuptools]
-py-modules = ["audiobook_export", "cli", "extract", "generate_audiobook_kokoro", "main", "ui"]
+py-modules = ["audiobook_export", "cli", "extract", "generate_audiobook_kokoro", "jobs", "library", "main", "ui", "voices"]
+packages = ["webui"]
+
+[tool.setuptools.package-data]
+webui = ["static/*", "static/**/*"]
 
 [tool.uv]
 default-groups = ["cpu"]

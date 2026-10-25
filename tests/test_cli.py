@@ -12,9 +12,15 @@ import generate_audiobook_kokoro
 
 class CliTests(unittest.TestCase):
     def test_no_arguments_opens_desktop(self):
+        run = Mock(return_value=0)
+        with patch.dict("sys.modules", {"webui.app": types.SimpleNamespace(run=run)}):
+            self.assertEqual(cli.main([]), 0)
+        run.assert_called_once_with(dev=False)
+
+    def test_classic_ui_opens_tk_window(self):
         app = Mock()
         with patch.dict("sys.modules", {"ui": types.SimpleNamespace(AudiobookApp=Mock(return_value=app))}):
-            self.assertEqual(cli.main([]), 0)
+            self.assertEqual(cli.main(["--ui", "classic"]), 0)
         app.mainloop.assert_called_once()
 
     def test_book_uses_shared_extraction_and_generation(self):
