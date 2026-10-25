@@ -85,7 +85,7 @@ uv run --group dev pytest -q
 
 Dependencies are declared in `pyproject.toml`; `uv.lock` records the resolved versions. There are no separate requirements files per operating system. The `preshed` compatibility pin prevents an English spaCy tokenizer load failure reproduced on macOS; the other native spaCy dependencies do not need old pins.
 
-The CI workflow defines CPU tests with Python 3.12 on Ubuntu, Windows and macOS. The runners install FFmpeg; Ubuntu uses Xvfb for native Tk tests. Tests run with Hugging Face offline and do not download Kokoro weights. JUnit results are saved as workflow artifacts. Linux verification is pending the first successful CI run.
+The CI workflow defines CPU tests with Python 3.12 on Ubuntu, Windows and macOS. The runners install FFmpeg; Ubuntu uses Xvfb for native Tk tests. Tests run with Hugging Face offline and do not download Kokoro weights. JUnit results are saved as workflow artifacts. See the [CI runs](https://github.com/mateogon/pdf-narrator/actions/workflows/ci.yml) for current platform results.
 
 The renewal was checked locally on Apple Silicon and on Windows 11 with Python 3.12.12 and an RTX 3050. Windows CPU/CUDA CLI synthesis and the test suite passed. The Windows GUI was constructed through SSH with CUDA visible and enabled; its desktop appearance and interactions were not visually reviewed. CI covers CPU behavior; CUDA and MPS synthesis need separate hardware checks.
 
