@@ -2,23 +2,29 @@
 
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
-from PyQt6.QtWidgets import QApplication, QFileDialog # Keep for file dialogs if preferred
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 import os
 import sys
 import threading
+import queue
 import time
 import json
 import subprocess # For opening folders cross-platform
+import shutil
+import tempfile
+from pathlib import Path
 
 # Keep these imports - assuming they exist and work
-from extract import extract_book
+from extract import extract_book, extracted_chapter_paths
 from generate_audiobook_kokoro import (
     generate_audiobooks_kokoro,
     generate_audio_for_all_voices_kokoro,
     test_single_voice_kokoro,
-    available_voices # Assuming this function is now in kokoro module
+    available_voices,
+    available_devices,
+    resolve_device,
+    natural_chapter_key,
 )
 
 # --- Constants ---
@@ -72,7 +78,7 @@ class SourceFrame(tb.Frame):
 
         # Single Book
         self.single_rb = tb.Radiobutton(
-            source_lf, text="Single Book (PDF/EPUB)", variable=self.source_option,
+            source_lf, text="Single Book", variable=self.source_option,
             value="single", command=self._update_ui, width=22
         )
         self.single_rb.grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
@@ -83,7 +89,7 @@ class SourceFrame(tb.Frame):
 
         # Batch Books
         self.batch_rb = tb.Radiobutton(
-            source_lf, text="Batch Folder (PDF/EPUB)", variable=self.source_option,
+            source_lf, text="Batch Folder", variable=self.source_option,
             value="batch", command=self._update_ui, width=22
         )
         self.batch_rb.grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
@@ -221,24 +227,22 @@ class SourceFrame(tb.Frame):
 
     def _browse_file_or_folder(self, mode):
         """Generalized browse function."""
-        qt_app = QApplication.instance() or QApplication(sys.argv)
         path = ""
         if mode == "single":
-            path, _ = QFileDialog.getOpenFileName(
-                None, "Select Book File", PROJECT_DIR,
-                "Book Files (*.pdf *.epub *.txt *.html *.htm);;All Files (*.*)"
+            path = filedialog.askopenfilename(
+                parent=self, title="Select Book File", initialdir=PROJECT_DIR,
+                filetypes=[("Book files", "*.pdf *.epub *.txt *.html *.htm"), ("All files", "*")],
             )
-            if path: self.pdf_path.set(path)
-        elif mode == "batch":
-            path = QFileDialog.getExistingDirectory(
-                None, "Select Folder Containing Books", PROJECT_DIR
+            if path:
+                self.pdf_path.set(path)
+        elif mode in ("batch", "skip"):
+            path = filedialog.askdirectory(
+                parent=self, title="Select Book Folder" if mode == "batch" else "Select Existing Text Folder",
+                initialdir=PROJECT_DIR, mustexist=True,
             )
-            if path: self.pdf_folder.set(path)
-        elif mode == "skip":
-            path = QFileDialog.getExistingDirectory(
-                None, "Select Existing Text Folder", PROJECT_DIR
-            )
-            if path: self.manual_extracted_dir.set(path)
+            if path:
+                target = self.pdf_folder if mode == "batch" else self.manual_extracted_dir
+                target.set(path)
 
         if path:
             self._update_output_paths(path, mode) # Update paths immediately after selection
@@ -292,6 +296,155 @@ class SourceFrame(tb.Frame):
         self._update_output_paths(source_path=loaded_path, source_type=loaded_option)
 
 
+class ChapterReviewFrame(tb.Frame):
+    """Review extracted files in place before passing them to the generator."""
+    def __init__(self, master, app, **kwargs):
+        super().__init__(master, padding=20, **kwargs)
+        self.app = app
+        self.paths = []
+        self.included = {}
+        self.current_path = None
+        self.include_current = tk.BooleanVar(value=True)
+        self.summary = tk.StringVar(value="Prepare a book to review its extracted chapters here.")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        tb.Label(self, textvariable=self.summary, wraplength=740).grid(row=0, column=0, sticky="w", pady=(0, 16))
+        panes = tb.Panedwindow(self, orient=HORIZONTAL)
+        panes.grid(row=1, column=0, sticky="nsew")
+        chapter_panel = tb.Frame(panes)
+        chapter_panel.grid_columnconfigure(0, weight=1)
+        chapter_panel.grid_rowconfigure(0, weight=1)
+        self.chapter_list = tk.Listbox(chapter_panel, width=28, exportselection=False, activestyle="dotbox")
+        self.chapter_list.grid(row=0, column=0, sticky="nsew")
+        scrollbar = tb.Scrollbar(chapter_panel, orient=VERTICAL, command=self.chapter_list.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.chapter_list.config(yscrollcommand=scrollbar.set)
+        self.chapter_list.bind("<<ListboxSelect>>", self._select_chapter)
+        editor_panel = tb.Frame(panes, padding=(16, 0, 0, 0))
+        editor_panel.grid_columnconfigure(0, weight=1)
+        editor_panel.grid_rowconfigure(1, weight=1)
+        self.include_check = tb.Checkbutton(
+            editor_panel, text="Include this chapter", variable=self.include_current,
+            command=self._set_included, state=DISABLED,
+        )
+        self.include_check.grid(row=0, column=0, sticky="w", pady=(0, 10))
+        self.editor = scrolledtext.ScrolledText(editor_panel, wrap=tk.WORD, undo=True, width=45, height=12, state=DISABLED)
+        self.editor.grid(row=1, column=0, sticky="nsew")
+        self.save_button = tb.Button(editor_panel, text="Save chapter", command=self.save_current, state=DISABLED)
+        self.save_button.grid(row=2, column=0, sticky="e", pady=(10, 0))
+        panes.add(chapter_panel, weight=1)
+        panes.add(editor_panel, weight=3)
+        actions = tb.Frame(self)
+        actions.grid(row=2, column=0, sticky="ew", pady=(18, 0))
+        tb.Label(actions, text="Edits save to the extracted text files.").pack(side=LEFT)
+        self.generate_button = tb.Button(
+            actions, text="Save & generate selected chapters", bootstyle=SUCCESS,
+            command=self.app.confirm_chapters, state=DISABLED,
+        )
+        self.generate_button.pack(side=RIGHT)
+
+    def reset(self):
+        self.paths = []
+        self.included = {}
+        self.current_path = None
+        self.chapter_list.config(state=NORMAL)
+        self.chapter_list.delete(0, tk.END)
+        self.editor.config(state=NORMAL)
+        self.editor.delete("1.0", tk.END)
+        self.editor.edit_modified(False)
+        self.editor.config(state=DISABLED)
+        self.include_check.config(state=DISABLED)
+        self.save_button.config(state=DISABLED)
+        self.generate_button.config(state=DISABLED)
+        self.summary.set("Prepare a book to review its extracted chapters here.")
+
+    def load_chapters(self, task_folders):
+        self.reset()
+        for text_dir, _ in task_folders:
+            self.paths.extend(str(Path(path).resolve()) for path in sorted(extracted_chapter_paths(text_dir), key=natural_chapter_key))
+        if not self.paths:
+            raise ValueError("No extracted chapters found. Check the source and extraction options.")
+        self.included = dict.fromkeys(self.paths, True)
+        self._refresh_list()
+        self.include_check.config(state=NORMAL)
+        self.save_button.config(state=NORMAL)
+        self.generate_button.config(state=NORMAL)
+        self.editor.config(state=NORMAL)
+        self.chapter_list.selection_set(0)
+        self._select_chapter()
+
+    def _refresh_list(self):
+        selected = self.chapter_list.curselection()
+        self.chapter_list.delete(0, tk.END)
+        for path in self.paths:
+            marker = "Include" if self.included[path] else "Skip"
+            self.chapter_list.insert(tk.END, f"{marker} · {Path(path).parent.name} / {Path(path).name}")
+        if selected:
+            self.chapter_list.selection_set(selected[0])
+        self.summary.set(f"{sum(self.included.values())} of {len(self.paths)} chapters included. Review the text, save edits, then generate audio.")
+
+    def _select_chapter(self, event=None):
+        selection = self.chapter_list.curselection()
+        if not selection:
+            return
+        path = self.paths[selection[0]]
+        if path == self.current_path:
+            return
+        if self.current_path and self.editor.edit_modified():
+            save = messagebox.askyesnocancel("Unsaved Chapter", "Save changes before opening another chapter?", parent=self)
+            if save is None or (save and not self.save_current()):
+                self.chapter_list.selection_clear(0, tk.END)
+                self.chapter_list.selection_set(self.paths.index(self.current_path))
+                return
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            messagebox.showerror("Cannot Open Chapter", str(exc), parent=self)
+            return
+        self.current_path = path
+        self.include_current.set(self.included[path])
+        self.editor.delete("1.0", tk.END)
+        self.editor.insert("1.0", text)
+        self.editor.edit_modified(False)
+
+    def _set_included(self):
+        if self.current_path:
+            self.included[self.current_path] = self.include_current.get()
+            self._refresh_list()
+
+    def save_current(self):
+        if not self.current_path or not self.editor.edit_modified():
+            return True
+        temporary_path = None
+        try:
+            chapter = Path(self.current_path)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=chapter.parent, prefix=f".{chapter.name}.", suffix=".tmp", delete=False) as handle:
+                temporary_path = handle.name
+                handle.write(self.editor.get("1.0", "end-1c"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            shutil.copymode(chapter, temporary_path)
+            os.replace(temporary_path, chapter)
+        except (OSError, UnicodeError) as exc:
+            messagebox.showerror("Cannot Save Chapter", str(exc), parent=self)
+            return False
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        self.editor.edit_modified(False)
+        return True
+
+    def selected_files(self):
+        return [path for path in self.paths if self.included[path]]
+
+    def finish(self):
+        self.editor.config(state=DISABLED)
+        self.include_check.config(state=DISABLED)
+        self.save_button.config(state=DISABLED)
+        self.generate_button.config(state=DISABLED)
+        self.chapter_list.config(state=DISABLED)
+
+
 class AudioFrame(tb.Frame):
     """Frame for Kokoro voice selection and audiobook generation settings."""
     def __init__(self, master, app, **kwargs):
@@ -304,14 +457,9 @@ class AudioFrame(tb.Frame):
         self.chunk_size_display = tk.StringVar(value="510 (Small)") # For combobox
         self.audio_format = tk.StringVar(value=".wav")
         self.audio_format_display = tk.StringVar(value=".wav (High Quality)") # For combobox
-        # Detect CUDA availability at runtime; default to CPU on macOS/where CUDA isn't available
-        try:
-            import torch
-            cuda_available = torch.cuda.is_available()
-        except Exception:
-            cuda_available = False
-        default_device = "cuda" if cuda_available else "cpu"
-        self.device = tk.StringVar(value=default_device)
+        self.devices = available_devices()
+        self.device = tk.StringVar(value="auto")
+        self.resume_existing = tk.BooleanVar(value=False)
         self.audio_output_dir = tk.StringVar() # Display only, set by app
 
         self.grid_columnconfigure(1, weight=1)
@@ -365,16 +513,15 @@ class AudioFrame(tb.Frame):
         tb.Label(settings_lf, text="Device:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
         device_frame = tb.Frame(settings_lf)
         device_frame.grid(row=2, column=1, sticky="w", pady=5)
-        self.gpu_rb = tb.Radiobutton(device_frame, text="GPU (CUDA)", variable=self.device, value="cuda")
-        self.gpu_rb.pack(side=LEFT, padx=(0, 15))
-        self.cpu_rb = tb.Radiobutton(device_frame, text="CPU", variable=self.device, value="cpu")
-        self.cpu_rb.pack(side=LEFT)
-        # Disable GPU option if CUDA is not available
-        if not cuda_available:
-            try:
-                self.gpu_rb.config(state=DISABLED)
-            except Exception:
-                pass
+        for device, label in (("auto", "Automatic"), ("cpu", "CPU"), ("cuda", "CUDA"), ("mps", "Apple GPU")):
+            tb.Radiobutton(
+                device_frame, text=label, variable=self.device, value=device,
+                state=NORMAL if device == "auto" or device in self.devices else DISABLED,
+            ).pack(side=LEFT, padx=(0, 15))
+        tb.Checkbutton(
+            settings_lf, text="Resume chapters already generated with these settings",
+            variable=self.resume_existing,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         # --- Output Directory Display ---
         out_lf = tb.Labelframe(self, text="Audiobook Output (Preview)", padding=15, bootstyle=SECONDARY)
@@ -424,6 +571,7 @@ class AudioFrame(tb.Frame):
             "chunk_size": self.chunk_size.get(),
             "audio_format": self.audio_format.get(),
             "device": self.device.get(),
+            "resume": self.resume_existing.get(),
         }
 
     def set_config(self, config):
@@ -435,7 +583,9 @@ class AudioFrame(tb.Frame):
 
         self.chunk_size.set(config.get("chunk_size", 510))
         self.audio_format.set(config.get("audio_format", ".wav"))
-        self.device.set(config.get("device", "cuda"))
+        saved_device = config.get("device", "auto")
+        self.device.set(saved_device if saved_device == "auto" or saved_device in self.devices else "auto")
+        self.resume_existing.set(config.get("resume", False))
 
         # Update display variables based on loaded internal values
         chunk_map = {510: "510 (Small)", 1020: "1020 (Medium)", 2040: "2040 (Large)"}
@@ -443,8 +593,8 @@ class AudioFrame(tb.Frame):
         self.chunk_size_display.set(chunk_map.get(self.chunk_size.get(), "510 (Small)"))
         self.audio_format_display.set(format_map.get(self.audio_format.get(), ".wav (High Quality)"))
     def get_device(self):
-        """Returns the currently selected device string ('cuda' or 'cpu')."""
-        return self.device.get() # Retrieve the value from the tk.StringVar
+        """Returns the selected device through the shared device owner."""
+        return resolve_device(self.device.get())
 
 class ControlFrame(tb.Frame):
     """Frame for process control buttons and primary status display."""
@@ -459,39 +609,39 @@ class ControlFrame(tb.Frame):
         self.progress_count_text = tk.StringVar(value="") # e.g., "(1 of 10)"
         self.estimated_time_text = tk.StringVar(value="Est. Time: N/A")
 
-        self.grid_columnconfigure(1, weight=1) # Make status expand
+        self.grid_columnconfigure(0, weight=1) # Make status expand
 
         # --- Buttons ---
         button_frame = tb.Frame(self)
         button_frame.grid(row=0, column=0, padx=(0, 20), pady=5, sticky="ns")
 
         self.start_button = tb.Button(
-            button_frame, text="▶ Start", bootstyle=SUCCESS,
+            button_frame, text="Prepare book", bootstyle=SUCCESS,
             command=self.app.start_process, width=10
         )
         self.start_button.pack(side=LEFT, padx=5)
 
         self.pause_button = tb.Button(
-            button_frame, text="⏸ Pause", bootstyle=WARNING,
+            button_frame, text="Pause", bootstyle=WARNING,
             command=self.app.pause_process, state=DISABLED, width=10
         )
         self.pause_button.pack(side=LEFT, padx=5)
 
         self.resume_button = tb.Button(
-            button_frame, text="⏯ Resume", bootstyle=INFO,
+            button_frame, text="Resume", bootstyle=INFO,
             command=self.app.resume_process, state=DISABLED, width=10
         )
         self.resume_button.pack(side=LEFT, padx=5)
 
         self.cancel_button = tb.Button(
-            button_frame, text="⏹ Cancel", bootstyle=DANGER,
+            button_frame, text="Cancel", bootstyle=DANGER,
             command=self.app.cancel_process, state=DISABLED, width=10
         )
         self.cancel_button.pack(side=LEFT, padx=5)
 
         # --- Status Display ---
         status_frame = tb.Frame(self)
-        status_frame.grid(row=0, column=1, sticky="ew", pady=5)
+        status_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=5)
         status_frame.grid_columnconfigure(1, weight=1) # Make file name expand
 
         # Row 1: Overall Status & Time
@@ -547,13 +697,13 @@ class ProgressFrame(tb.Frame):
         progress_lf.grid_columnconfigure(1, weight=1) # Make bars expand inside labelframe
 
         # Extract Progress
-        tb.Label(progress_lf, text="📄 Text Extraction:", width=18).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        tb.Label(progress_lf, text="Text Extraction:", width=18).grid(row=0, column=0, sticky="w", padx=(0, 10))
         self.extract_bar = tb.Progressbar(progress_lf, variable=self.extract_progress, maximum=100, bootstyle=INFO)
         self.extract_bar.grid(row=0, column=1, sticky="ew", pady=5)
         tb.Label(progress_lf, textvariable=self.extract_percent, width=5).grid(row=0, column=2, sticky="e", padx=(10, 0))
 
         # Audio Progress
-        tb.Label(progress_lf, text="🔊 Audio Generation:", width=18).grid(row=1, column=0, sticky="w", padx=(0, 10))
+        tb.Label(progress_lf, text="Audio Generation:", width=18).grid(row=1, column=0, sticky="w", padx=(0, 10))
         self.audio_bar = tb.Progressbar(progress_lf, variable=self.audio_progress, maximum=100, bootstyle=SUCCESS)
         self.audio_bar.grid(row=1, column=1, sticky="ew", pady=5)
         tb.Label(progress_lf, textvariable=self.audio_percent, width=5).grid(row=1, column=2, sticky="e", padx=(10, 0))
@@ -579,7 +729,7 @@ class ProgressFrame(tb.Frame):
         """Safely appends message to the log text widget from any thread."""
         try:
             # Use 'after' to ensure GUI update happens in the main thread
-            self.app.after(0, self._insert_log, msg)
+            self.app.post_to_ui(self._insert_log, msg)
         except Exception as e:
             # Fallback to console if GUI is closing or unavailable
             print(f"(Log Error: {e}) {msg}", file=sys.__stderr__)
@@ -612,6 +762,8 @@ class VoiceTestFrame(tb.Frame):
         self.cancellation_flag = False
         self.pause_event = threading.Event() # For potential future pause/resume in test
         self.pause_event.set()
+        self.player = None
+        self.sample_path = tk.StringVar(value="")
 
         # Variables
         self.test_text = tk.StringVar(value="This is a sample text to test the selected voice.")
@@ -627,7 +779,8 @@ class VoiceTestFrame(tb.Frame):
         self.grid_columnconfigure(0, weight=1)
 
         # --- Test Mode ---
-        mode_lf = tb.Labelframe(self, text="Test Mode", padding=15, bootstyle=INFO)
+        mode_lf = tb.Labelframe(self, text="Test Mode", padding=(15, 10), bootstyle=INFO)
+        self.mode_frame = mode_lf
         mode_lf.grid(row=0, column=0, sticky="ew", padx=10, pady=(0, 10))
         tb.Radiobutton(
             mode_lf, text="Test Single Voice", variable=self.test_mode,
@@ -639,7 +792,7 @@ class VoiceTestFrame(tb.Frame):
         ).pack(side=LEFT)
 
         # --- Voice Selection (Single Mode Only) ---
-        self.voice_lf = tb.Labelframe(self, text="Voice Selection", padding=15, bootstyle=INFO)
+        self.voice_lf = tb.Labelframe(self, text="Voice Selection", padding=(15, 10), bootstyle=INFO)
         # self.voice_lf is gridded in _update_ui
         self.voice_lf.grid_columnconfigure(1, weight=1)
         tb.Label(self.voice_lf, text="Select Voice:").grid(row=0, column=0, sticky="w", padx=(0, 10))
@@ -656,16 +809,16 @@ class VoiceTestFrame(tb.Frame):
 
         # --- Sample Text ---
         text_lf = tb.Labelframe(self, text="Sample Text", padding=(15, 10), bootstyle=SECONDARY)
-        text_lf.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        text_lf.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
         text_lf.grid_columnconfigure(0, weight=1)
         text_lf.grid_rowconfigure(0, weight=1) # Allow text box to grow slightly if needed
-        self.text_input = scrolledtext.ScrolledText(text_lf, height=5, wrap=tk.WORD, bd=0)
+        self.text_input = scrolledtext.ScrolledText(text_lf, height=4, wrap=tk.WORD, bd=0)
         self.text_input.grid(row=0, column=0, sticky="ew")
         self.text_input.insert(tk.END, self.test_text.get())
 
         # --- Output & Controls ---
-        control_lf = tb.Labelframe(self, text="Output & Controls", padding=15, bootstyle=SECONDARY)
-        control_lf.grid(row=3, column=0, sticky="ew", padx=10, pady=10)
+        control_lf = tb.Labelframe(self, text="Output & Controls", padding=(15, 10), bootstyle=SECONDARY)
+        control_lf.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
         control_lf.grid_columnconfigure(1, weight=1) # Make status expand
 
         # Output Dir
@@ -678,11 +831,11 @@ class VoiceTestFrame(tb.Frame):
 
         # Buttons
         self.run_button = tb.Button(
-            control_lf, text="▶ Run Test", bootstyle=SUCCESS, width=12, command=self._start_test
+            control_lf, text="Generate sample", bootstyle=SUCCESS, width=12, command=self._start_test
         )
         self.run_button.grid(row=1, column=0, sticky="w", pady=(5, 0))
         self.stop_button = tb.Button(
-            control_lf, text="⏹ Stop Test", bootstyle=DANGER, width=12, command=self._stop_test, state=DISABLED
+            control_lf, text="Cancel test", bootstyle=DANGER, width=12, command=self._stop_test, state=DISABLED
         )
         self.stop_button.grid(row=1, column=1, sticky="w", padx=10, pady=(5, 0))
 
@@ -692,8 +845,8 @@ class VoiceTestFrame(tb.Frame):
 
 
         # --- Progress Bar ---
-        progress_lf = tb.Labelframe(self, text="Test Progress", padding=(15,10), bootstyle=SECONDARY)
-        progress_lf.grid(row=4, column=0, sticky="ew", padx=10, pady=(10, 0))
+        progress_lf = tb.Labelframe(self, text="Test Progress", padding=(15, 5), bootstyle=SECONDARY)
+        progress_lf.grid(row=4, column=0, sticky="ew", padx=10, pady=(5, 0))
         progress_lf.grid_columnconfigure(0, weight=1)
 
         self.progressbar = tb.Progressbar(progress_lf, variable=self.progress_var, maximum=100)
@@ -701,12 +854,21 @@ class VoiceTestFrame(tb.Frame):
         self.progress_label = tb.Label(progress_lf, textvariable=self.progress_label_text)
         self.progress_label.grid(row=1, column=0, sticky="ew", pady=(0, 5))
 
+        playback = tb.Frame(self)
+        playback.grid(row=5, column=0, sticky="ew", padx=10, pady=(10, 0))
+        playback.grid_columnconfigure(0, weight=1)
+        self.sample_combo = tb.Combobox(playback, textvariable=self.sample_path, state="readonly")
+        self.sample_combo.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.play_button = tb.Button(playback, text="Play sample", command=self._play_sample, state=DISABLED)
+        self.play_button.grid(row=0, column=1, padx=(0, 8))
+        self.stop_playback_button = tb.Button(playback, text="Stop playback", command=self.stop_playback, state=DISABLED)
+        self.stop_playback_button.grid(row=0, column=2)
         self._update_ui() # Initial setup
 
     def _update_ui(self):
         """Show/hide single voice selection based on mode."""
         if self.test_mode.get() == "single":
-            self.voice_lf.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
+            self.voice_lf.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
         else:
             self.voice_lf.grid_forget()
 
@@ -723,17 +885,15 @@ class VoiceTestFrame(tb.Frame):
         self.stop_button.config(state=NORMAL if running else DISABLED)
         # Disable mode/voice selection while running
         state = DISABLED if running else NORMAL
-        for child in self.master.master.winfo_children(): # Access mode radio buttons via parent notebook tab
-             if isinstance(child, tb.Labelframe) and "Mode" in child.cget('text'):
-                  for rb in child.winfo_children():
-                       if isinstance(rb, tb.Radiobutton): rb.config(state=state)
+        for child in self.mode_frame.winfo_children():
+            child.config(state=state)
         self.voice_combo.config(state=DISABLED if running else 'readonly')
         self.text_input.config(state=DISABLED if running else NORMAL)
 
 
     def _progress_callback(self, progress, label_info="", index=0, total=0):
         """Callback for updating progress bar and labels during test."""
-        self.app.after(0, self._update_progress_gui, progress, label_info, index, total)
+        self.app.post_to_ui(self._update_progress_gui, progress, label_info, index, total)
 
     def _update_progress_gui(self, progress, label_info="", index=0, total=0):
          if not self.winfo_exists(): return
@@ -751,6 +911,9 @@ class VoiceTestFrame(tb.Frame):
 
 
     def _start_test(self):
+        if self.app.is_running:
+            messagebox.showinfo("In Progress", "Wait for audiobook generation to finish before testing a voice.")
+            return
         if self.test_thread and self.test_thread.is_alive():
             messagebox.showinfo("In Progress", "A voice test is already running.")
             return
@@ -769,7 +932,12 @@ class VoiceTestFrame(tb.Frame):
         self._update_status("Starting test...")
         self._set_button_state(running=True)
 
-        self.test_thread = threading.Thread(target=self._run_test_thread, args=(test_text,), daemon=True)
+        self.stop_playback()
+        settings = {
+            "mode": self.test_mode.get(), "output_dir": self.test_output_dir.get(),
+            "device": self.app.audio_frame.get_device(), "voice": self.selected_voice.get(),
+        }
+        self.test_thread = threading.Thread(target=self._run_test_thread, args=(test_text, settings), daemon=True)
         self.test_thread.start()
 
     def _stop_test(self):
@@ -781,106 +949,106 @@ class VoiceTestFrame(tb.Frame):
              self._update_status("No test running")
 
 
-    def _run_test_thread(self, test_text):
-        """Background thread for running the voice tests."""
+    def _run_test_thread(self, test_text, settings):
+        """Only plain values cross the worker boundary; Tk updates return to the main thread."""
         try:
-            mode = self.test_mode.get()
-            output_dir = self.test_output_dir.get()
-            device = self.app.audio_frame.get_device() # Get device from audio frame
+            output_dir = settings["output_dir"]
             os.makedirs(output_dir, exist_ok=True)
-
-            if mode == "single":
-                voice = self.selected_voice.get()
-                if not voice: raise ValueError("No voice selected for single test.")
-
-                # --- CORRECT lang_code derivation for single test ---
-                lang_code = voice[0] # Use first letter (e.g., 'a' from 'am_liam')
-                # --- End Correction ---
-
-                self._update_status(f"Testing: {voice}")
+            if settings["mode"] == "single":
+                voice = settings["voice"]
                 output_file = os.path.join(output_dir, f"test_{voice}.wav")
-
-                # Pass the corrected lang_code and device
-                test_single_voice_kokoro(
-                    input_text=test_text,
-                    voice=voice,
-                    output_path=output_file,
-                    lang_code=lang_code, # Pass the single letter code
-                    device=device,       # Pass the selected device
-                    speed=1.0,
-                    split_pattern=r'[.!?]+', # Simpler split for testing
-                    cancellation_flag=lambda: self.cancellation_flag,
-                    # Modify progress callback for single test context if needed
-                    progress_callback=lambda p, fname, idx, total: self._progress_callback(p, voice), # Simplified for single file
-                    pause_event=self.pause_event
+                self.app.post_to_ui(self._update_status, f"Testing: {voice}")
+                success = test_single_voice_kokoro(
+                    input_text=test_text, voice=voice, output_path=output_file,
+                    lang_code=voice[0], device=settings["device"], speed=1.0,
+                    split_pattern=r'[.!?]+', cancellation_flag=lambda: self.cancellation_flag,
+                    progress_callback=lambda p, fname, idx, total: self._progress_callback(p, voice),
+                    pause_event=self.pause_event,
                 )
-                final_progress = 100
-
-            else: # mode == "all"
-                temp_dir = os.path.join(PROJECT_DIR, "voice_test_temp")
-                os.makedirs(temp_dir, exist_ok=True)
-                temp_file = os.path.join(temp_dir, "test_text.txt")
-                with open(temp_file, "w", encoding="utf-8") as f: f.write(test_text)
-
-                voices_to_test = self.voice_list
-                if not voices_to_test: raise ValueError("No voices available to test.")
-
-                total_voices = len(voices_to_test)
-                self._update_status(f"Testing {total_voices} voices...")
-
-                # --- CORRECT lang_code derivation for 'all' test ---
-                # Assume all voices tested belong to the same language family
-                # Use the lang code from the *first* voice in the list
-                lang_code = voices_to_test[0][0]
-                # --- End Correction ---
-
-                # Pass the corrected lang_code and device
-                generate_audio_for_all_voices_kokoro(
-                    input_path=temp_file,
-                    lang_code=lang_code, # Pass the single letter code
-                    voices=voices_to_test,
-                    output_dir=output_dir,
-                    device=device,       # Pass the selected device
-                    speed=1.0,
-                    split_pattern=r'[.!?]+', # Simpler split for testing
-                    cancellation_flag=lambda: self.cancellation_flag,
-                    # Pass the correct progress callback signature expected by the function
-                    progress_callback=self._progress_callback, # UI method handles overall progress
-                    pause_event=self.pause_event
-                )
-                final_progress = 100
-
-                # Clean up temp file
-                try:
-                    if os.path.exists(temp_file): os.remove(temp_file)
-                    if os.path.exists(temp_dir) and not os.listdir(temp_dir): os.rmdir(temp_dir)
-                except OSError as e: print(f"Warning: Could not clean up temp test file: {e}")
-
-
-            # --- GUI updates after completion (run via app.after) ---
-            if not self.cancellation_flag:
-                 self.app.after(0, lambda: self._progress_callback(final_progress, "Completed")) # Ensure 100%
-                 self._update_status("Test completed!")
-                 self.app.after(100, self._ask_open_folder)
+                if not success:
+                    raise RuntimeError("The voice engine could not generate the sample. See the process log.")
+                samples = [output_file]
             else:
-                 self._update_status("Test cancelled.")
-                 self.app.after(0, lambda: self._progress_callback(0, "Cancelled")) # Reset progress bar
-
-
-        except Exception as e:
-            error_msg = f"Test Error: {e}"
+                self.app.post_to_ui(self._update_status, f"Testing {len(self.voice_list)} voices...")
+                with tempfile.TemporaryDirectory(prefix="pdf-narrator-voice-") as temp_dir:
+                    temp_file = os.path.join(temp_dir, "sample.txt")
+                    Path(temp_file).write_text(test_text, encoding="utf-8")
+                    samples = generate_audio_for_all_voices_kokoro(
+                        input_path=temp_file, voices=self.voice_list, output_dir=output_dir,
+                        lang_code=self.voice_list[0][0], device=settings["device"], speed=1.0,
+                        split_pattern=r'[.!?]+', cancellation_flag=lambda: self.cancellation_flag,
+                        progress_callback=self._progress_callback, pause_event=self.pause_event,
+                    )
+            if self.cancellation_flag:
+                raise InterruptedError("Voice test cancelled")
+            self.app.post_to_ui(self._sample_completed, samples)
+        except InterruptedError:
+            self.app.post_to_ui(self._update_status, "Test cancelled.")
+        except Exception as exc:
+            error_msg = f"Test Error: {exc}"
             print(error_msg)
-            import traceback
-            traceback.print_exc()
-            self.app.after(0, lambda: messagebox.showerror("Test Error", error_msg))
-            self._update_status("Test failed!")
-            self.app.after(0, lambda: self._progress_callback(0, "Error")) # Reset progress bar
+            self.app.post_to_ui(self._update_status, "Test failed. See the process log.")
+            self.app.post_to_ui(lambda msg=error_msg: messagebox.showerror("Test Error", msg))
         finally:
-            self.app.after(0, self._set_button_state, False)
+            self.app.post_to_ui(self._set_button_state, False)
 
-    def _ask_open_folder(self):
-         if messagebox.askyesno("Test Complete", "Voice test finished. Open the output folder?"):
-                self._open_output_folder()
+    def _sample_completed(self, samples):
+        samples = [path for path in samples if os.path.isfile(path)]
+        self.sample_combo.config(values=samples)
+        self.sample_path.set(samples[0] if samples else "")
+        self.play_button.config(state=NORMAL if samples else DISABLED)
+        self.progress_var.set(100)
+        self._update_status("Sample ready. Select Play sample to listen.")
+
+    def _play_sample(self):
+        self.stop_playback()
+        path = self.sample_path.get()
+        if not os.path.isfile(path):
+            messagebox.showwarning("Sample Not Found", "Generate a voice sample before playing it.")
+            return
+        try:
+            if sys.platform == "win32":
+                import winsound
+                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            else:
+                if sys.platform == "darwin":
+                    command = ["afplay", path]
+                elif shutil.which("paplay"):
+                    command = ["paplay", path]
+                elif shutil.which("aplay"):
+                    command = ["aplay", path]
+                elif shutil.which("ffplay"):
+                    command = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", path]
+                else:
+                    raise RuntimeError("Install an audio player (paplay, aplay or ffplay) to play samples here.")
+                self.player = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.app.after(200, self._check_playback)
+            self.stop_playback_button.config(state=NORMAL)
+            self._update_status("Playing sample")
+        except (OSError, RuntimeError) as exc:
+            self._update_status("Playback failed")
+            messagebox.showerror("Playback Error", str(exc))
+
+    def _check_playback(self):
+        if self.player is None:
+            return
+        result = self.player.poll()
+        if result is None:
+            self.app.after(200, self._check_playback)
+        else:
+            self.player = None
+            self.stop_playback_button.config(state=DISABLED)
+            self._update_status("Sample ready" if result == 0 else "Playback failed. Check the audio output device.")
+
+    def stop_playback(self):
+        if self.player is not None:
+            if self.player.poll() is None:
+                self.player.terminate()
+            self.player = None
+        if sys.platform == "win32":
+            import winsound
+            winsound.PlaySound(None, 0)
+        self.stop_playback_button.config(state=DISABLED)
 
 
 # --- Main Application Window ---
@@ -892,10 +1060,12 @@ class AudiobookApp(tb.Window):
         super().__init__(themename=self.selected_theme, *args, **kwargs)
 
         self.title("PDF Narrator")
-        self.geometry("950x750") # Adjusted size
-        self.minsize(800, 650)
+        self.geometry("1000x820")
+        self.minsize(820, 780)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.ui_queue = queue.Queue()
+        self.closing = False
 
         # --- Process State ---
         self.process_thread = None
@@ -904,6 +1074,8 @@ class AudiobookApp(tb.Window):
         self.pause_event.set() # Start in the 'running' (not paused) state
         self.is_running = False
         self.is_paused = False
+        self.review_ready = threading.Event()
+        self.selected_chapters = []
 
         # --- Main Layout ---
         self.grid_columnconfigure(0, weight=1)
@@ -921,12 +1093,14 @@ class AudiobookApp(tb.Window):
         # Create tab frames (simple frames, content added by specific classes)
         self.source_tab = tb.Frame(self.notebook)
         self.audio_tab = tb.Frame(self.notebook)
+        self.review_tab = tb.Frame(self.notebook)
         self.progress_tab = tb.Frame(self.notebook)
         self.voice_test_tab = tb.Frame(self.notebook)
 
         self.notebook.add(self.source_tab, text=" 1. Source Setup ")
         self.notebook.add(self.audio_tab, text=" 2. Audio Setup ")
-        self.notebook.add(self.progress_tab, text=" 3. Process & Logs ")
+        self.notebook.add(self.review_tab, text=" 3. Review Chapters ")
+        self.notebook.add(self.progress_tab, text=" Process & Logs ")
         self.notebook.add(self.voice_test_tab, text=" Voice Test ")
 
         # --- Populate Tabs ---
@@ -936,6 +1110,9 @@ class AudiobookApp(tb.Window):
 
         self.audio_frame = AudioFrame(self.audio_tab, app=self)
         self.audio_frame.pack(fill=BOTH, expand=True)
+
+        self.review_frame = ChapterReviewFrame(self.review_tab, app=self)
+        self.review_frame.pack(fill=BOTH, expand=True)
 
         self.progress_frame = ProgressFrame(self.progress_tab, app=self) # Manages bars & logs
         self.progress_frame.pack(fill=BOTH, expand=True)
@@ -979,6 +1156,25 @@ class AudiobookApp(tb.Window):
         self.control_frame.set_button_states(running=False, paused=False) # Initial button state
 
         self.source_frame._update_ui() # Initial UI update
+        self.after(40, self._drain_ui_queue)
+
+    def post_to_ui(self, callback, *args):
+        """Workers enqueue plain values; only the main thread calls Tk."""
+        if not self.closing:
+            self.ui_queue.put((callback, args))
+
+    def _drain_ui_queue(self):
+        for _ in range(200):
+            try:
+                callback, args = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(*args)
+            except Exception:
+                self.report_callback_exception(*sys.exc_info())
+        if not self.closing:
+            self.after(40, self._drain_ui_queue)
 
     # --- Theme and Config Handling ---
     def _load_theme_from_config(self):
@@ -999,10 +1195,9 @@ class AudiobookApp(tb.Window):
             self.source_frame.set_config(config.get("source_settings", {}))
             self.audio_frame.set_config(config.get("audio_settings", {}))
 
-            # Load and apply theme last
+            # The theme was applied when the window was initialized.
             self.selected_theme = config.get("theme", DEFAULT_THEME)
             self.theme_var.set(self.selected_theme)
-            self.style.theme_use(self.selected_theme)
 
         except Exception as e:
             print(f"Error loading config: {e}")
@@ -1068,12 +1263,16 @@ class AudiobookApp(tb.Window):
 
     # --- Process Control Methods ---
     def start_process(self):
+        if self.voice_test_frame.test_thread and self.voice_test_frame.test_thread.is_alive():
+            messagebox.showinfo("Voice Test Running", "Wait for the voice test to finish before preparing a book.")
+            return
         if self.is_running:
             print("Process already running.")
             return
 
         # --- Gather all configuration just before starting ---
         try:
+            self.source_frame._update_output_paths()
             self.config_data = {
                 "source": self.source_frame.get_config(),
                 "audio": self.audio_frame.get_config(),
@@ -1108,6 +1307,11 @@ class AudiobookApp(tb.Window):
         except Exception as e:
              messagebox.showerror("Error", f"An unexpected error occurred during setup: {e}")
              return
+
+        self.review_ready.clear()
+        self.selected_chapters = []
+        self.review_frame.reset()
+        self.notebook.select(self.progress_tab)
 
         # --- Start Process ---
         self.is_running = True
@@ -1148,7 +1352,7 @@ class AudiobookApp(tb.Window):
             # The thread's finally block will reset state fully
 
     def _update_gui_progress(self, extract_p=None, audio_p=None, status=None, action=None, file=None, count_str=None, est_time_str=None):
-         """Helper to safely update GUI elements from the process thread via 'after'."""
+         """Queue progress updates for the main Tk thread."""
          update_args = {}
          if status is not None: update_args["status"] = status
          if action is not None: update_args["action"] = action
@@ -1156,7 +1360,7 @@ class AudiobookApp(tb.Window):
          if count_str is not None: update_args["count_str"] = count_str
          if est_time_str is not None: update_args["est_time_str"] = est_time_str
 
-         self.after(0, lambda: (
+         self.post_to_ui(lambda: (
               self.progress_frame.update_progress(extract_p, audio_p),
               self.control_frame.update_status(**update_args) if update_args else None
          ))
@@ -1197,6 +1401,8 @@ class AudiobookApp(tb.Window):
 
                     def single_extract_progress(p):
                         if self.cancellation_flag: raise InterruptedError("Extraction cancelled")
+                        if p is None:
+                            return
                         self._update_gui_progress(extract_p=p)
                         # Simple time estimate based on progress
                         elapsed = time.time() - start_time
@@ -1208,7 +1414,8 @@ class AudiobookApp(tb.Window):
                     extract_book(
                         pdf_path, use_toc=use_toc, extract_mode=extract_mode,
                         output_dir=extracted_base_output, # e.g., ./extracted_books/MyBook
-                        progress_callback=single_extract_progress
+                        progress_callback=single_extract_progress,
+                        language=cfg["audio"]["voicepack"][0],
                     )
                     all_task_folders.append((extracted_base_output, audio_base_output))
                     print(f"Successfully extracted: {filename}")
@@ -1244,6 +1451,8 @@ class AudiobookApp(tb.Window):
 
                         def batch_extract_progress(p):
                             if self.cancellation_flag: raise InterruptedError("Extraction cancelled")
+                            if p is None:
+                                return
                             overall_p = ((i - 1 + p / 100.0) / total_files) * 100
                             self._update_gui_progress(extract_p=overall_p)
                             elapsed = time.time() - start_time
@@ -1253,7 +1462,8 @@ class AudiobookApp(tb.Window):
                         extract_book(
                             book_path, use_toc=use_toc, extract_mode=extract_mode,
                             output_dir=current_extract_output,
-                            progress_callback=batch_extract_progress
+                            progress_callback=batch_extract_progress,
+                            language=cfg["audio"]["voicepack"][0],
                         )
                         all_task_folders.append((current_extract_output, current_audio_output))
                         print(f"({i}/{total_files}) Extracted: {filename}")
@@ -1291,6 +1501,20 @@ class AudiobookApp(tb.Window):
                 print(f"Found {len(all_task_folders)} text folder(s) to process for audio generation.")
 
 
+            self._update_gui_progress(status="Review chapters before generation", est_time_str="Waiting for review")
+            self.post_to_ui(self._show_chapter_review, all_task_folders)
+            while not self.review_ready.wait(0.1):
+                if self.cancellation_flag:
+                    raise InterruptedError("Chapter review cancelled")
+            if self.cancellation_flag:
+                raise InterruptedError("Chapter review cancelled")
+            all_task_folders = [
+                task for task in all_task_folders
+                if any(os.path.dirname(path) == os.path.abspath(task[0]) for path in self.selected_chapters)
+            ]
+            if not all_task_folders:
+                raise ValueError("No chapters selected for generation.")
+
             # --- 2. Audio Generation Phase ---
             if self.cancellation_flag: raise InterruptedError("Cancelled before audio generation")
 
@@ -1303,8 +1527,7 @@ class AudiobookApp(tb.Window):
                  # Handle case where voice might be empty, though validation should prevent this
                  raise ValueError("Invalid or empty voice selected.")
             audio_format = audio_cfg["audio_format"]
-            chunk_size = audio_cfg["chunk_size"] # Not directly used by kokoro func? Check generate_audiobooks_kokoro
-            device = audio_cfg["device"] # Not directly used by kokoro func? Check generate_audiobooks_kokoro
+            device = audio_cfg["device"]
 
             total_tasks = len(all_task_folders)
             if total_tasks == 0:
@@ -1347,8 +1570,9 @@ class AudiobookApp(tb.Window):
                      audio_format=audio_format,
                      # speed=1.0, # Assuming default speed, add if needed
                      # split_pattern=r'\n+', # Assuming default split, add if needed
-                     # device=device # Pass device if kokoro func supports it
-                     # chunk_size=chunk_size # Pass chunk_size if kokoro func supports it
+                     device=device,
+                     resume=audio_cfg.get("resume", False),
+                     selected_files=[path for path in self.selected_chapters if os.path.dirname(path) == os.path.abspath(text_input_dir)],
                      progress_callback=audio_progress_callback, # Use the combined callback
                      cancellation_flag=lambda: self.cancellation_flag,
                      pause_event=self.pause_event, # Pass the pause event
@@ -1364,41 +1588,66 @@ class AudiobookApp(tb.Window):
             success_msg = f"Process completed successfully in {self._format_time(total_time)}."
             print(success_msg)
             self._update_gui_progress(status="Completed", action="-", file="", count_str="", est_time_str=f"Total Time: {self._format_time(total_time)}")
-            self.after(100, lambda: messagebox.showinfo("Success", success_msg))
+            self.post_to_ui(lambda: messagebox.showinfo("Success", success_msg))
 
 
         except FileNotFoundError as e:
              error_msg = f"Error: {e}"
              print(error_msg)
              self._update_gui_progress(status="Failed", action="Error")
-             self.after(0, lambda: messagebox.showerror("File Not Found", error_msg))
+             self.post_to_ui(lambda: messagebox.showerror("File Not Found", error_msg))
         except ValueError as e: # Configuration errors
              error_msg = f"Configuration Error: {e}"
              print(error_msg)
              self._update_gui_progress(status="Failed", action="Config Error")
-             self.after(0, lambda: messagebox.showerror("Configuration Error", error_msg))
+             self.post_to_ui(lambda: messagebox.showerror("Configuration Error", error_msg))
         except InterruptedError as e: # User cancellation
              error_msg = f"Process Cancelled: {e}"
              print(error_msg)
              self._update_gui_progress(status="Cancelled", action="-", file="", count_str="")
-             self.after(0, lambda: messagebox.showwarning("Cancelled", "The process was cancelled by the user."))
+             self.post_to_ui(lambda: messagebox.showwarning("Cancelled", "The process was cancelled by the user."))
         except Exception as e:
             error_msg = f"An unexpected error occurred: {e}"
             print(error_msg)
             import traceback
             traceback.print_exc() # Log full traceback to console
             self._update_gui_progress(status="Failed", action="Error")
-            self.after(0, lambda: messagebox.showerror("Runtime Error", error_msg))
+            self.post_to_ui(lambda: messagebox.showerror("Runtime Error", error_msg))
         finally:
             # --- Reset state regardless of outcome ---
             self.is_running = False
             self.is_paused = False
             self.cancellation_flag = False
             self.pause_event.set() # Ensure it's set for the next run
-            # Update button states via 'after' to ensure it's done in main thread
-            self.after(0, lambda: self.control_frame.set_button_states(running=False, paused=False))
+            # Queue widget changes for the main thread.
+            self.post_to_ui(self.review_frame.finish)
+            self.post_to_ui(lambda: self.control_frame.set_button_states(running=False, paused=False))
             print("-" * 20 + " Process Finished " + "-" * 20)
 
+
+    def _show_chapter_review(self, task_folders):
+        try:
+            self.review_frame.load_chapters(task_folders)
+            self.notebook.select(self.review_tab)
+            self.control_frame.pause_button.config(state=DISABLED)
+            self.control_frame.resume_button.config(state=DISABLED)
+        except Exception as exc:
+            self.cancellation_flag = True
+            self.review_ready.set()
+            messagebox.showerror("Chapter Review", str(exc))
+
+    def confirm_chapters(self):
+        selected = self.review_frame.selected_files()
+        if not selected:
+            messagebox.showwarning("No Chapters Selected", "Include at least one chapter before generating audio.")
+            return
+        if not self.review_frame.save_current():
+            return
+        self.selected_chapters = selected
+        self.review_frame.finish()
+        self.notebook.select(self.progress_tab)
+        self.control_frame.set_button_states(running=True, paused=False)
+        self.review_ready.set()
 
     # --- Window Closing ---
     def on_close(self):
@@ -1420,14 +1669,15 @@ class AudiobookApp(tb.Window):
              self.voice_test_frame.test_thread.join(timeout=1.0)
 
 
+        self.closing = True
+        self.voice_test_frame.stop_playback()
         self.save_config()
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
         self.destroy() # Close the Tkinter window
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Optional: Initialize QApplication early if using QFileDialog consistently
-    # qt_app = QApplication.instance() or QApplication(sys.argv)
-
     app = AudiobookApp()
     app.mainloop()
