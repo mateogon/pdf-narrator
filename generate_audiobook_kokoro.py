@@ -1,22 +1,25 @@
-# generate_audiobook_kokoro.py
+"""Shared Kokoro generation for the CLI and desktop app."""
 
+import hashlib
+import json
 import os
+import re
+import tempfile
 import time
+from pathlib import Path
+
+# Torch reads this at import time. Unsupported MPS operators may run on CPU.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import numpy as np
-import torch
 import soundfile as sf
-import re # Needed for split_pattern if used differently
-import traceback # For more detailed error logging
-from kokoro import KPipeline # Assuming KPipeline handles device internally or takes it as arg
+import torch
+from kokoro import KPipeline
 
-# --- Constants ---
 DEFAULT_SAMPLE_RATE = 24000
-if os.uname().sysname == "Darwin":
-    DEVICE = "cpu" # Default to CPU on macOS for compatibility
-else:
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_REPO = "hexgrad/Kokoro-82M"
+DEVICE = "auto"
 
-# --- Helper Functions ---
 
 def available_voices():
     """Return the hard-coded list of available Kokoro voice identifiers."""
@@ -35,603 +38,285 @@ def available_voices():
         "pf_dora", "pm_alex", "pm_santa"
     ]
 
-# --- Core Audio Generation for a Single File ---
 
-def generate_audio_for_file_kokoro(
-    input_path,
-    pipeline,         # Pre-initialized KPipeline instance
-    voice,            # Voice identifier (e.g., "am_liam")
-    output_path,
-    speed=1.0,
-    split_pattern=r'\n+',
-    cancellation_flag=None,
-    chunk_progress_callback=None, # Renamed for clarity: reports chunk progress
-    pause_event=None
-):
-    """
-    Generates audio for a single text file using a pre-initialized Kokoro pipeline.
+def available_devices():
+    """Return usable backends; CPU is always available."""
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    if torch.backends.mps.is_available():
+        devices.append("mps")
+    return devices
 
-    Args:
-        input_path (str): Path to the input text file.
-        pipeline (KPipeline): An initialized Kokoro pipeline instance.
-        voice (str): The voice identifier to use.
-        output_path (str): Path to save the generated audio file.
-        speed (float): Speech speed multiplier.
-        split_pattern (str): Regex pattern for splitting text into chunks for TTS.
-        cancellation_flag (callable): Function returning True to cancel.
-        chunk_progress_callback (callable): Callback reporting (chars_in_chunk, chunk_duration).
-        pause_event (threading.Event): Event to pause processing.
 
-    Returns:
-        bool: True if audio generation was successful and saved, False otherwise.
-    """
-    start_file_read = time.time()
-    try:
-        with open(input_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-        if not text.strip():
-            print(f"      Warning: Input file '{os.path.basename(input_path)}' is empty. Skipping.")
-            return False
-    except FileNotFoundError:
-        print(f"      Error: Input file not found: {input_path}")
-        return False
-    except Exception as e:
-        print(f"      Error reading file '{os.path.basename(input_path)}': {e}")
-        return False
-    # print(f"      Read file in {time.time() - start_file_read:.3f}s") # Optional debug log
+def resolve_device(device="auto"):
+    """Resolve auto, or fall back to CPU for an unavailable accelerator."""
+    if device not in {"auto", "cpu", "cuda", "mps"}:
+        raise ValueError(f"Unknown device: {device}")
+    devices = available_devices()
+    if device == "auto":
+        return next((name for name in ("cuda", "mps", "cpu") if name in devices))
+    if device not in devices:
+        print(f"Warning: {device.upper()} is unavailable; using CPU.")
+        return "cpu"
+    return device
 
+
+def _pipeline(lang_code, device):
+    return KPipeline(lang_code=lang_code, device=resolve_device(device), repo_id=MODEL_REPO)
+
+
+def _raise_if_cancelled(cancellation_flag):
     if cancellation_flag and cancellation_flag():
-        print("      Cancellation detected before audio synthesis.")
         raise InterruptedError("Processing cancelled by user.")
-    if pause_event: pause_event.wait() # Wait if paused
-
-    audio_chunks = []
-    total_chars_in_file = len(text) # Approx total chars for this file
-    chars_processed_in_file = 0
-    start_synth_time = time.time()
-    last_callback_time = start_synth_time
-
-    print(f"      Synthesizing audio...")
-    try:
-        # Iterate through generated audio chunks from the pipeline
-        for chunk_index, (gs, ps, audio) in enumerate(pipeline(text, voice=voice, speed=speed, split_pattern=split_pattern)):
-
-            if cancellation_flag and cancellation_flag():
-                print("      Cancellation detected during audio synthesis.")
-                raise InterruptedError("Processing cancelled by user.")
-            if pause_event: pause_event.wait() # Wait if paused
-
-            # Process the audio chunk
-            if isinstance(audio, torch.Tensor):
-                audio = audio.cpu().numpy() # Move to CPU and convert to NumPy if needed
-            audio_chunks.append(audio)
-
-            # Update progress based on this chunk
-            chars_in_chunk = len(gs) if gs else 0 # Length of graphemes in the chunk
-            chars_processed_in_file += chars_in_chunk
-            current_time = time.time()
-            chunk_duration = current_time - last_callback_time
-            last_callback_time = current_time
-
-            if chunk_progress_callback and chars_in_chunk > 0:
-                 # Report characters processed in this chunk and its duration
-                 chunk_progress_callback(chars_in_chunk, chunk_duration)
-
-    except Exception as e:
-        print(f"      Error during Kokoro pipeline processing for '{os.path.basename(input_path)}': {e}")
-        traceback.print_exc() # Print detailed traceback for debugging
-        return False # Indicate failure for this file
-
-    if not audio_chunks:
-        print(f"      Warning: No audio chunks generated for '{os.path.basename(input_path)}'.")
-        return False
-
-    # Concatenate, Normalize, and Save
-    try:
-        print(f"      Concatenating {len(audio_chunks)} audio chunks...")
-        combined_audio = np.concatenate(audio_chunks)
-
-        # Normalize audio to prevent clipping and fit int16 range
-        max_abs_val = np.max(np.abs(combined_audio))
-        if max_abs_val > 0: # Avoid division by zero for silent audio
-             # Normalize to ~95% of max range to leave some headroom
-             normalized_audio = (combined_audio / max_abs_val * 32767 * 0.95).astype(np.int16)
-        else:
-             normalized_audio = combined_audio.astype(np.int16) # Already silent
-
-        print(f"      Saving audio to '{os.path.basename(output_path)}'...")
-        sf.write(output_path, normalized_audio, DEFAULT_SAMPLE_RATE)
-        # Removed verbose "Audio saved to..." log from here
-
-    except Exception as e:
-        print(f"      Error concatenating or saving audio for '{os.path.basename(output_path)}': {e}")
-        return False
-
-    return True # Indicate success for this file
 
 
-# --- Main Function for Processing a Directory ---
+def _checkpoint(cancellation_flag, pause_event):
+    _raise_if_cancelled(cancellation_flag)
+    if pause_event is not None:
+        while not pause_event.wait(0.1):
+            _raise_if_cancelled(cancellation_flag)
+    _raise_if_cancelled(cancellation_flag)
 
-def generate_audiobooks_kokoro(
-    input_dir,
-    lang_code,           # Language code for the pipeline (e.g., 'a')
-    voice,               # Voice identifier (e.g., "am_liam")
-    device=DEVICE,       # Device for TTS computation ('cuda' or 'cpu')
-    output_dir=None,     # Optional: Defaults to 'input_dir_audio' sibling folder
-    audio_format=".wav", # Output audio format (ensure soundfile supports it)
-    speed=1.0,
-    split_pattern=r'\n+',
-    progress_callback=None,      # Callback for overall progress (percentage, current_file, index, total)
-    cancellation_flag=None,
-    pause_event=None,
-    # Removed file_callback (merged into progress_callback)
-    # Removed update_estimate_callback (handled internally if needed or by UI)
-):
+
+def _spoken_text(text):
+    # Keep Unicode letters/digits; underscores and punctuation are not speech.
+    return bool(re.search(r"[^\W_]", text or "", re.UNICODE))
+
+
+def _audio_array(audio):
+    if audio is None:
+        return None
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().to(device="cpu", dtype=torch.float32).numpy()
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        return None
+    if audio.ndim != 1 or not np.isfinite(audio).all():
+        raise ValueError("Kokoro returned non-finite or non-mono audio.")
+    # Kokoro produces [-1, 1] floats; fixed clipping avoids chapter-wide copies.
+    return np.clip(audio, -1.0, 1.0)
+
+
+def _stream_audio(text, pipeline, voice, writer, speed, split_pattern,
+                  cancellation_flag, chunk_progress_callback, pause_event):
+    frames = 0
+    last_chunk = time.monotonic()
+    _checkpoint(cancellation_flag, pause_event)
+    for graphemes, _, audio in pipeline(text, voice=voice, speed=speed, split_pattern=split_pattern):
+        _checkpoint(cancellation_flag, pause_event)
+        if not _spoken_text(graphemes):
+            continue
+        samples = _audio_array(audio)
+        if samples is None:
+            raise ValueError("Kokoro returned empty audio for spoken text.")
+        writer.write(samples)
+        frames += len(samples)
+        now = time.monotonic()
+        if chunk_progress_callback:
+            chunk_progress_callback(len(graphemes), now - last_chunk)
+        last_chunk = now
+    _checkpoint(cancellation_flag, pause_event)
+    if not frames:
+        raise ValueError("Kokoro produced no spoken audio.")
+
+
+def generate_audio_for_file_kokoro(input_path, pipeline, voice, output_path,
+                                   speed=1.0, split_pattern=r'\n+',
+                                   cancellation_flag=None, chunk_progress_callback=None,
+                                   pause_event=None):
+    """Stream one chapter atomically. Failure preserves any previous output.
+
+    Returns False for synthesis/write failures. Cancellation raises InterruptedError.
     """
-    Generates audio files from all .txt files in a directory using Kokoro TTS.
-
-    Args:
-        input_dir (str): Path to the directory containing .txt files.
-        lang_code (str): Kokoro language code (e.g., 'a', 'b', 'j').
-        voice (str): Kokoro voice identifier (e.g., 'am_liam').
-        device (str): Computation device ('cuda' or 'cpu').
-        output_dir (str, optional): Directory to save audio files. Defaults to sibling directory.
-        audio_format (str): File extension for audio output (e.g., '.wav', '.mp3').
-        speed (float): Speech speed multiplier.
-        split_pattern (str): Regex for splitting text for TTS processing.
-        progress_callback (callable, optional): Reports overall progress.
-            Receives: (overall_percentage, current_filename, current_index, total_files).
-        cancellation_flag (callable, optional): Function returning True to cancel.
-        pause_event (threading.Event, optional): Event to pause processing.
-
-    Returns:
-        list[str]: List of paths to successfully generated audio files.
-
-    Raises:
-        FileNotFoundError: If input_dir does not exist.
-        ValueError: If lang_code or device is invalid.
-        Exception: For errors during pipeline initialization or processing.
-    """
-    start_process_time = time.time()
-    # Resolve device: if CUDA requested but not available, fall back to CPU
+    temporary = None
     try:
-        if device == "cuda" and not torch.cuda.is_available():
-            print("  Warning: CUDA requested but not available; falling back to CPU.")
-            device = "cpu"
-    except Exception:
-        # If torch is not functional for device checks, default to CPU
-        device = "cpu"
-    print(f"\n--- Starting Audiobook Generation Task ---")
-    print(f"  Input Directory : '{input_dir}'")
-    print(f"  Language / Voice: {lang_code} / {voice}")
-    print(f"  Device          : {device}")
-
-    if not os.path.isdir(input_dir):
-        raise FileNotFoundError(f"Input directory not found: '{input_dir}'")
-
-    # --- Determine and Create Output Directory ---
-    if output_dir is None:
-        parent_dir = os.path.dirname(os.path.normpath(input_dir))
-        book_name = os.path.basename(os.path.normpath(input_dir))
-        output_dir = os.path.join(parent_dir, f"{book_name}_audio")
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        print(f"  Output Directory: '{output_dir}'")
-    except OSError as e:
-        print(f"  Error creating output directory '{output_dir}': {e}")
+        text = Path(input_path).read_text(encoding="utf-8")
+        text = "\n".join(line for line in text.splitlines() if _spoken_text(line))
+        if not _spoken_text(text):
+            raise ValueError("Input contains no letters or digits.")
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=destination.suffix, delete=False) as handle:
+            temporary = Path(handle.name)
+        with sf.SoundFile(temporary, mode="w", samplerate=DEFAULT_SAMPLE_RATE, channels=1) as writer:
+            _stream_audio(text, pipeline, voice, writer, speed, split_pattern,
+                          cancellation_flag, chunk_progress_callback, pause_event)
+        _checkpoint(cancellation_flag, pause_event)
+        os.replace(temporary, destination)
+        return True
+    except InterruptedError:
         raise
-
-    # --- Gather and Sort Text Files ---
-    try:
-        files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.txt')])
-        total_files = len(files)
-        if total_files == 0:
-            print("  Warning: No .txt files found in the input directory. Nothing to process.")
-            return []
-        print(f"  Files to process: {total_files}")
-    except Exception as e:
-        print(f"  Error listing files in '{input_dir}': {e}")
-        raise
-
-    # --- Initialize Kokoro Pipeline ---
-    pipeline = None # Define outside try block
-    try:
-        print(f"  Initializing Kokoro pipeline for lang='{lang_code}' on device='{device}'...")
-        init_start_time = time.time()
-        # *** CRUCIAL: Assuming KPipeline accepts 'device' argument ***
-        pipeline = KPipeline(lang_code=lang_code, device=device, repo_id='hexgrad/Kokoro-82M')
-        print(f"  Pipeline initialized in {time.time() - init_start_time:.2f}s.")
-    except AssertionError as e:
-         # Catch assertion errors specifically, often related to invalid lang_code
-         print(f"  Error: Invalid language code '{lang_code}' provided for KPipeline.")
-         print(f"  Details: {e}")
-         raise ValueError(f"Invalid language code: {lang_code}") from e
-    except Exception as e:
-        print(f"  Error initializing Kokoro pipeline: {e}")
-        traceback.print_exc()
-        raise # Re-raise other initialization errors
-
-    # --- Prepare for Progress Tracking ---
-    # Pre-calculate total characters for smoother progress estimation
-    total_characters_all_files = 0
-    print("  Calculating total text size for progress estimation...")
-    for text_file in files:
-        try:
-            with open(os.path.join(input_dir, text_file), 'r', encoding='utf-8') as f:
-                total_characters_all_files += len(f.read())
-        except Exception as e:
-            print(f"    Warning: Could not read file '{text_file}' for size calculation: {e}")
-    print(f"  Total characters approx: {total_characters_all_files}")
-
-    characters_processed_so_far = 0
-    start_loop_time = time.time() # For rate calculation within the loop
-    generated_files = []
-    files_processed_successfully = 0
-
-    # --- Define Inner Callback for Chunk Progress ---
-    def internal_chunk_progress_callback(chars_in_chunk, chunk_duration, current_filename, current_index, total_files):
-        nonlocal characters_processed_so_far
-        characters_processed_so_far += chars_in_chunk
-
-        # Calculate overall progress percentage based on characters
-        overall_progress = 0
-        if total_characters_all_files > 0:
-             overall_progress = (characters_processed_so_far / total_characters_all_files) * 100
-             overall_progress = min(max(overall_progress, 0), 100) # Clamp between 0 and 100
-
-        # Report overall progress back to the main UI callback
-        if progress_callback:
-            # Pass overall %, current filename, current index, total files
-            progress_callback(overall_progress, current_filename, current_index, total_files)
-
-        # Note: Time estimation can be done here or in the UI based on progress and elapsed time
-        # elapsed_loop_time = time.time() - start_loop_time
-        # if overall_progress > 1 and update_estimate_callback: # Avoid early jumpy estimates
-        #     total_estimated_time = (elapsed_loop_time / (overall_progress / 100.0))
-        #     remaining_time = max(0, total_estimated_time - elapsed_loop_time)
-        #     update_estimate_callback(int(remaining_time))
-
-
-    # --- Process Each File ---
-    print("\n--- Processing Files ---")
-    try:
-        for i, text_file in enumerate(files, start=1):
-            if cancellation_flag and cancellation_flag():
-                print(f"\nCancellation detected before processing '{text_file}'.")
-                raise InterruptedError("Processing cancelled by user.")
-            if pause_event: pause_event.wait() # Check pause before each file
-
-            print(f"\n[{i}/{total_files}] Processing: '{text_file}'")
-            file_start_time = time.time()
-            input_path = os.path.join(input_dir, text_file)
-            base_name = os.path.splitext(text_file)[0]
-            output_filename = f"{base_name}{audio_format}"
-            output_path = os.path.join(output_dir, output_filename)
-
-            # --- Call the file generation function ---
-            # Pass a lambda that captures the current file context for the internal callback
-            file_chunk_callback = lambda chars, duration: internal_chunk_progress_callback(
-                chars, duration, text_file, i, total_files
-            )
-
-            success = generate_audio_for_file_kokoro(
-                input_path=input_path,
-                pipeline=pipeline,
-                voice=voice,
-                output_path=output_path,
-                speed=speed,
-                split_pattern=split_pattern,
-                cancellation_flag=cancellation_flag,
-                chunk_progress_callback=file_chunk_callback, # Use the context-aware lambda
-                pause_event=pause_event
-            )
-
-            file_elapsed_time = time.time() - file_start_time
-            if success:
-                print(f"   Successfully processed '{text_file}' in {file_elapsed_time:.2f}s")
-                generated_files.append(output_path)
-                files_processed_successfully += 1
-            else:
-                print(f"   Failed to process '{text_file}' (check logs above)")
-
-    except InterruptedError as e:
-         print("\n--- Audiobook Generation Cancelled ---")
-         # Progress callback might not be 100%, handle in UI if needed
-         if progress_callback: progress_callback(None, "Cancelled", i, total_files) # Signal cancellation
-         # Don't re-raise, allow finally block to run
-    except Exception as e:
-         print(f"\n--- An Unexpected Error Occurred During Processing ---")
-         print(f"   Error: {e}")
-         traceback.print_exc()
-         if progress_callback: progress_callback(None, "Error", i, total_files) # Signal error
-         # Don't re-raise, allow finally block to run
+    except Exception as error:
+        print(f"Failed to generate {output_path}: {error}")
+        return False
     finally:
-        # --- Cleanup / Final Report ---
-        print("\n--- Audiobook Generation Finished ---")
-        total_process_time = time.time() - start_process_time
-        print(f"  Successfully generated: {files_processed_successfully} / {total_files} files")
-        print(f"  Total time elapsed  : {total_process_time:.2f} seconds")
-        # Ensure progress reaches 100% only if fully completed without cancellation/error
-        if files_processed_successfully == total_files and not (cancellation_flag and cancellation_flag()):
-             if progress_callback: progress_callback(100, "Completed", total_files, total_files)
-
-    return generated_files
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
-# --- Functions for Testing ---
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-def generate_audio_for_all_voices_kokoro(
-    input_path,          # Path to the single .txt file for testing
-    lang_code,           # Language code for the pipeline
-    voices,              # List of voice identifiers to test
-    output_dir,          # Directory to save test audio files
-    device=DEVICE,       # Device ('cuda' or 'cpu')
-    speed=1.0,
-    split_pattern=r'\n+',
-    cancellation_flag=None, # Optional cancellation
-    progress_callback=None,   # Callback(overall_perc, voice_name, index, total)
-    pause_event=None       # Optional pause event
-):
-    """
-    Generates audio samples for multiple voices from a single text file.
 
-    Args:
-        input_path (str): Path to the source .txt file.
-        lang_code (str): Kokoro language code.
-        voices (list[str]): List of voice identifiers to test.
-        output_dir (str): Directory to save output audio files.
-        device (str): Computation device ('cuda' or 'cpu').
-        speed (float): Speech speed multiplier.
-        split_pattern (str): Regex for splitting text.
-        cancellation_flag (callable, optional): Function returning True to cancel.
-        progress_callback (callable, optional): Reports overall progress.
-        pause_event (threading.Event, optional): Event to pause processing.
-    """
-    print(f"\n--- Starting Test Generation for All Voices ---")
-    print(f"  Input File : '{input_path}'")
-    print(f"  Language   : {lang_code}")
-    print(f"  Device     : {device}")
+def _resume_record(input_path, settings):
+    return {"version": 1, "source_sha256": _sha256(input_path), "settings": settings}
 
-    if not os.path.isfile(input_path):
-        print(f"  Error: Input text file not found: '{input_path}'")
+
+def _can_resume(output_path, record):
+    try:
+        stored = json.loads(Path(str(output_path) + ".resume.json").read_text(encoding="utf-8"))
+        expected = dict(record, audio_sha256=_sha256(output_path))
+        info = sf.info(output_path)
+        return stored == expected and info.frames > 0 and info.samplerate == DEFAULT_SAMPLE_RATE
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _save_resume(output_path, record):
+    sidecar = Path(str(output_path) + ".resume.json")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=sidecar.parent, encoding="utf-8", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(dict(record, audio_sha256=_sha256(output_path)), handle)
+        os.replace(temporary, sidecar)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _chapter(input_path, output_path, pipeline, voice, settings, resume,
+             cancellation_flag, pause_event, chunk_callback):
+    record = _resume_record(input_path, settings)
+    if resume and _can_resume(output_path, record):
+        print(f"Resuming: verified {Path(output_path).name}")
         return
+    success = generate_audio_for_file_kokoro(
+        input_path, pipeline, voice, output_path, settings["speed"], settings["split_pattern"],
+        cancellation_flag, chunk_callback, pause_event)
+    if not success:
+        raise RuntimeError(f"Audio generation failed: {input_path}")
+    _save_resume(output_path, record)
+
+
+def _chapter_progress(callback, input_path, index, total):
+    if callback is None:
+        return None
+    total_chars = max(len(input_path.read_text(encoding="utf-8")), 1)
+    processed = 0
+
+    def report(chars, duration):
+        nonlocal processed
+        processed += chars
+        fraction = min(processed / total_chars, 0.99)
+        callback(100 * (index - 1 + fraction) / total, input_path.name, index, total)
+
+    return report
+
+
+def natural_chapter_key(path):
+    """Sort extracted chapter 2 before chapter 10, keeping filename text order."""
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", Path(path).name)]
+
+
+def _selected_chapters(input_dir, selected_files):
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"Input directory not found: {input_dir}")
+    from extract import extracted_chapter_paths
+
+    files = sorted((Path(path) for path in extracted_chapter_paths(input_dir)), key=natural_chapter_key)
+    if selected_files is not None:
+        selected = {Path(path).resolve() for path in selected_files}
+        known = {path.resolve() for path in files}
+        if not selected.issubset(known):
+            raise ValueError("Selected chapters must belong to the current chapter set.")
+        files = [path for path in files if path.resolve() in selected]
+    if not files:
+        raise ValueError(f"No .txt chapters found in {input_dir}")
+    return files
+
+
+def generate_audiobooks_kokoro(input_dir, lang_code, voice, device="auto", output_dir=None,
+                                audio_format=".wav", speed=1.0, split_pattern=r'\n+',
+                                progress_callback=None, cancellation_flag=None,
+                                pause_event=None, resume=False, selected_files=None):
+    """Generate chapters; return all paths only after successful completion.
+
+    Resume is explicit and checks source, synthesis settings and audio integrity.
+    Completed chapters remain usable after an interrupted book run.
+    """
+    input_dir = Path(input_dir)
+    files = _selected_chapters(input_dir, selected_files)
+    audio_format = "." + audio_format.lower().lstrip(".")
+    if audio_format not in {".wav", ".mp3"}:
+        raise ValueError("Chapter audio format must be wav or mp3.")
+    if not np.isfinite(speed) or speed <= 0:
+        raise ValueError("Speed must be a positive finite number.")
+    output_dir = Path(output_dir or input_dir.with_name(input_dir.name + "_audio"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = resolve_device(device)
+    _checkpoint(cancellation_flag, pause_event)
+    pipeline = _pipeline(lang_code, device)
+    settings = dict(lang_code=lang_code, voice=voice, device=device, speed=speed,
+                    split_pattern=split_pattern, audio_format=audio_format, model=MODEL_REPO)
+    generated = []
+    for index, input_path in enumerate(files, 1):
+        _checkpoint(cancellation_flag, pause_event)
+        output_path = output_dir / (input_path.stem + audio_format)
+        if progress_callback:
+            progress_callback(100 * (index - 1) / len(files), input_path.name, index, len(files))
+        _chapter(input_path, output_path, pipeline, voice, settings, resume,
+                 cancellation_flag, pause_event, _chapter_progress(progress_callback, input_path, index, len(files)))
+        generated.append(str(output_path))
+    _checkpoint(cancellation_flag, pause_event)
+    if progress_callback:
+        progress_callback(100, "Completed", len(files), len(files))
+    return generated
+
+
+def generate_audio_for_all_voices_kokoro(input_path, lang_code, voices, output_dir,
+                                         device="auto", speed=1.0, split_pattern=r'\n+',
+                                         cancellation_flag=None, progress_callback=None,
+                                         pause_event=None):
+    """Generate voice samples, reusing the pipeline within each language."""
     if not voices:
-        print("  Warning: No voices provided for testing.")
-        return
-
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        print(f"  Output Dir : '{output_dir}'")
-    except OSError as e:
-        print(f"  Error creating output directory '{output_dir}': {e}")
-        return
-
-    # --- Initialize Pipeline Once ---
+        raise ValueError("Select at least one voice.")
     pipeline = None
-    try:
-        print(f"  Initializing Kokoro pipeline for lang='{lang_code}' on device='{device}'...")
-        # Resolve device similarly as above
-        try:
-            if device == "cuda" and not torch.cuda.is_available():
-                print("  Warning: CUDA requested but not available; falling back to CPU.")
-                device = "cpu"
-        except Exception:
-            device = "cpu"
-        pipeline = KPipeline(lang_code=lang_code, device=device)
-    except Exception as e:
-        print(f"  Error initializing Kokoro pipeline: {e}")
-        traceback.print_exc()
-        return
-
-    total_voices = len(voices)
-    print(f"  Voices to test: {total_voices}")
-
-    characters_processed_so_far = 0
-    total_chars_in_file = 0 # Calculate once
-    try:
-         with open(input_path, 'r', encoding='utf-8') as f:
-              total_chars_in_file = len(f.read())
-    except Exception: pass # Ignore error here, will be caught later if file is bad
-
-    # --- Define Inner Callback for Chunk Progress ---
-    def internal_test_chunk_callback(chars_in_chunk, chunk_duration, current_voice, current_index, total_voices):
-        nonlocal characters_processed_so_far
-        # Accumulate characters processed *within the current voice's generation*
-        # For overall progress across voices, we use the voice index.
-        # This callback might be less useful here unless you want intra-voice progress.
-
-        # Calculate overall progress based on voice index
-        overall_progress = ((current_index - 1) / total_voices) * 100 # Progress before current voice finishes
-        # We could try to estimate progress *within* the current voice based on chars,
-        # but let's keep it simple and update based on completed voices.
-
+    current_language = None
+    generated = []
+    for index, voice in enumerate(voices, 1):
+        _checkpoint(cancellation_flag, pause_event)
+        if voice[0] != current_language:
+            current_language = voice[0]
+            pipeline = _pipeline(current_language, device)
+        output_path = str(Path(output_dir) / f"test_{voice}.wav")
+        if not generate_audio_for_file_kokoro(input_path, pipeline, voice, output_path, speed,
+                                              split_pattern, cancellation_flag, None, pause_event):
+            raise RuntimeError(f"Voice sample generation failed: {voice}")
+        generated.append(output_path)
         if progress_callback:
-            # Pass overall % based on voice index, current voice name, index, total
-            progress_callback(overall_progress, current_voice, current_index, total_voices)
-
-    # --- Loop Through Voices ---
-    print("\n--- Generating Voice Samples ---")
-    try:
-        for i, voice in enumerate(voices, start=1):
-            if cancellation_flag and cancellation_flag():
-                print(f"\nCancellation detected before processing voice '{voice}'.")
-                raise InterruptedError("Processing cancelled by user.")
-            if pause_event: pause_event.wait()
-
-            print(f"\n[{i}/{total_voices}] Testing Voice: '{voice}'")
-            file_start_time = time.time()
-            output_filename = f"test_{voice}.wav" # Use WAV for testing consistency
-            output_path = os.path.join(output_dir, output_filename)
-
-            # Pass a lambda that captures the current voice context
-            test_chunk_callback = lambda chars, duration: internal_test_chunk_callback(
-                 chars, duration, voice, i, total_voices
-            )
-
-            success = generate_audio_for_file_kokoro(
-                input_path=input_path,
-                pipeline=pipeline,
-                voice=voice,
-                output_path=output_path,
-                speed=speed,
-                split_pattern=split_pattern,
-                cancellation_flag=cancellation_flag,
-                chunk_progress_callback=test_chunk_callback, # Use context-aware lambda
-                pause_event=pause_event
-            )
-
-            file_elapsed_time = time.time() - file_start_time
-            if success:
-                 print(f"   Successfully generated sample for '{voice}' in {file_elapsed_time:.2f}s")
-                 # Update progress after successful completion of a voice
-                 if progress_callback: progress_callback((i / total_voices) * 100, voice, i, total_voices)
-            else:
-                 print(f"   Failed to generate sample for '{voice}'")
-                 # Optionally break or continue on failure
-
-    except InterruptedError:
-         print("\n--- Voice Test Generation Cancelled ---")
-    except Exception as e:
-         print(f"\n--- An Unexpected Error Occurred During Voice Testing ---")
-         print(f"   Error: {e}")
-         traceback.print_exc()
-    finally:
-         print("\n--- Voice Test Generation Finished ---")
-         # Ensure 100% is reported if fully completed
-         if not (cancellation_flag and cancellation_flag()):
-              if progress_callback: progress_callback(100, "Completed", total_voices, total_voices)
+            progress_callback(100 * index / len(voices), voice, index, len(voices))
+    return generated
 
 
-def test_single_voice_kokoro(
-    input_text,          # Raw text string
-    voice,               # Voice identifier
-    output_path,         # Full path for the output audio file
-    lang_code="a",       # Language code (must match voice)
-    device=DEVICE,       # Device ('cuda' or 'cpu')
-    speed=1.0,
-    split_pattern=r'\n+',
-    cancellation_flag=None,
-    progress_callback=None,   # Callback(overall_perc, filename, 1, 1)
-    pause_event=None
-):
-    """
-    Generates a test audio sample for a single voice from a text string.
-
-    Creates a temporary file to hold the text.
-
-    Args:
-        input_text (str): The text to synthesize.
-        voice (str): Kokoro voice identifier.
-        output_path (str): Full path to save the output audio file.
-        lang_code (str): Kokoro language code.
-        device (str): Computation device ('cuda' or 'cpu').
-        speed (float): Speech speed multiplier.
-        split_pattern (str): Regex for splitting text.
-        cancellation_flag (callable, optional): Function returning True to cancel.
-        progress_callback (callable, optional): Reports overall progress (0-100).
-        pause_event (threading.Event, optional): Event to pause processing.
-
-    Returns:
-        str or None: Path to the generated audio file on success, None on failure.
-    """
-    import tempfile # Keep import local as it's only used here
-
-    print(f"\n--- Starting Single Voice Test ---")
-    print(f"  Voice      : {voice}")
-    print(f"  Language   : {lang_code}")
-    print(f"  Device     : {device}")
-    print(f"  Output File: '{output_path}'")
-
-    if not input_text.strip():
-        print("  Error: Input text is empty.")
-        return None
-
-    temp_file_path = None # Define outside try
-    try:
-        # --- Create Temporary File ---
-        with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False, encoding='utf-8') as temp_file:
-            temp_file_path = temp_file.name
-            temp_file.write(input_text)
-        print(f"  Created temp input file: '{temp_file_path}'")
-
-        # --- Initialize Pipeline ---
-        pipeline = None
-        try:
-            print(f"  Initializing Kokoro pipeline...")
-            try:
-                if device == "cuda" and not torch.cuda.is_available():
-                    print("  Warning: CUDA requested but not available; falling back to CPU.")
-                    device = "cpu"
-            except Exception:
-                device = "cpu"
-            pipeline = KPipeline(lang_code=lang_code, device=device)
-        except Exception as e:
-            print(f"  Error initializing Kokoro pipeline: {e}")
-            traceback.print_exc()
-            return None # Cannot proceed without pipeline
-
-        # --- Ensure Output Directory Exists ---
-        try:
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        except OSError as e:
-            print(f"  Error creating output directory for '{output_path}': {e}")
+def test_single_voice_kokoro(input_text, voice, output_path, lang_code="a", device="auto",
+                             speed=1.0, split_pattern=r'\n+', cancellation_flag=None,
+                             progress_callback=None, pause_event=None):
+    """Generate a sample; return its path only when the audio was published."""
+    with tempfile.TemporaryDirectory() as temporary:
+        input_path = Path(temporary) / "sample.txt"
+        input_path.write_text(input_text, encoding="utf-8")
+        _checkpoint(cancellation_flag, pause_event)
+        pipeline = _pipeline(lang_code, device)
+        if not generate_audio_for_file_kokoro(input_path, pipeline, voice, output_path, speed,
+                                              split_pattern, cancellation_flag, None, pause_event):
             return None
-
-        # --- Define Progress Callback ---
-        total_chars_in_file = len(input_text)
-        chars_processed_so_far = 0
-        def single_test_chunk_callback(chars_in_chunk, chunk_duration):
-             nonlocal chars_processed_so_far
-             chars_processed_so_far += chars_in_chunk
-             overall_progress = 0
-             if total_chars_in_file > 0:
-                  overall_progress = (chars_processed_so_far / total_chars_in_file) * 100
-                  overall_progress = min(max(overall_progress, 0), 100)
-             if progress_callback:
-                  # Pass progress %, fixed filename context "Test Sample", index 1 of 1
-                  progress_callback(overall_progress, "Test Sample", 1, 1)
-
-        # --- Generate Audio ---
-        print(f"  Generating test audio...")
-        start_time = time.time()
-        success = generate_audio_for_file_kokoro(
-            input_path=temp_file_path,
-            pipeline=pipeline,
-            voice=voice,
-            output_path=output_path,
-            speed=speed,
-            split_pattern=split_pattern,
-            cancellation_flag=cancellation_flag,
-            chunk_progress_callback=single_test_chunk_callback, # Use specific callback
-            pause_event=pause_event
-        )
-        elapsed_time = time.time() - start_time
-
-        if success:
-            print(f"  Successfully generated test sample in {elapsed_time:.2f}s")
-            print(f"  Output saved to: '{output_path}'")
-            if progress_callback: progress_callback(100, "Completed", 1, 1) # Ensure 100% on success
-            return output_path
-        else:
-            print(f"  Failed to generate test sample for voice '{voice}'")
-            if progress_callback: progress_callback(None, "Failed", 1, 1) # Signal failure
-            return None
-
-    except InterruptedError:
-        print("\n--- Single Voice Test Cancelled ---")
-        if progress_callback: progress_callback(None, "Cancelled", 1, 1)
-        return None
-    except Exception as e:
-        print(f"\n--- An Unexpected Error Occurred During Single Voice Test ---")
-        print(f"   Error: {e}")
-        traceback.print_exc()
-        if progress_callback: progress_callback(None, "Error", 1, 1)
-        return None
-    finally:
-        # --- Clean up Temporary File ---
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.remove(temp_file_path)
-                # print(f"  Cleaned up temp file: '{temp_file_path}'") # Optional debug log
-            except OSError as e:
-                print(f"  Warning: Could not remove temporary file '{temp_file_path}': {e}")
+    if progress_callback:
+        progress_callback(100, "Completed", 1, 1)
+    return output_path

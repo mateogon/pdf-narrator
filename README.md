@@ -1,254 +1,96 @@
 # PDF Narrator
-> Looking for my newer audiobook tool?
-> Check out **Cadence**: https://github.com/mateogon/Cadence
 
-**Updated for Kokoro v1.0!**  
-Now setting up is easier—simply install the required Python dependencies (including the updated Kokoro package) and run the app. No more manual downloads or moving model files into specific folders.
+Convert PDF, EPUB, TXT and HTML books into audiobooks with local [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) speech synthesis. Use the desktop interface or the command line.
 
-PDF Narrator (Kokoro Edition) transforms your **PDF and EPUB documents** into audiobooks effortlessly using **advanced text extraction** and **Kokoro TTS** technology. With Kokoro v1.0, the integration is seamless and the setup is as simple as installing the requirements and running the application.
+> For a reader with synchronized EPUB text and audio, see [Cadence](https://github.com/mateogon/Cadence).
 
----
+![Desktop interface](assets/demo.png)
 
-## Demo
+## Install and run
 
-1. **Screenshot**  
-   Check out the GUI in the screenshot below:  
-   ![Demo Screenshot](assets/demo.png)
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git, then run:
 
-2. **Audio Sample**  
-   Listen to a short sample of the generated audiobook:  
-   - af_sky
-   
-https://github.com/user-attachments/assets/f1e0a88b-9d44-40d6-82c4-dcf070db6856
+```bash
+git clone https://github.com/mateogon/pdf-narrator.git
+cd pdf-narrator
+uv run pdf-narrator
+```
 
-   - am_liam
-   
-https://github.com/user-attachments/assets/de611592-9404-416a-8118-1acca1651edf
+uv installs Python 3.12 and the locked dependencies automatically. You do not need to activate a virtual environment. The same commands work in PowerShell, bash, zsh and fish.
 
-   - af_heart
-   
-https://github.com/user-attachments/assets/b9d87ed4-3458-4116-accf-0816ec1448b2
+The default installation uses CPU PyTorch wheels on Windows and Linux. On Apple Silicon, PyTorch includes MPS support; the app selects it when available. NVIDIA support is optional below. Java, DeepSpeed, a CUDA Toolkit installation and manual eSpeak installation are not required by the default setup. The English tokenizer is installed with the app; Kokoro downloads its model and selected voices on first synthesis, so that first run needs internet access.
 
+The desktop interface needs Tk. If Python reports `No module named tkinter`, install a Python build with Tk support or your distribution's Python Tk package. The command line can run without a display.
 
+## Command line
 
----
+```bash
+uv run pdf-narrator book.epub --voice af_heart
+uv run pdf-narrator book.pdf --voice ef_dora --lang e --output-dir ./audio
+uv run pdf-narrator book.txt --device cpu --format mp3
+uv run pdf-narrator book.epub --format m4b --title "My book" --author "An author"
+uv run pdf-narrator book.epub --resume
+uv run pdf-narrator --help
+```
 
-## Features
+With no input argument, `pdf-narrator` opens the desktop interface. `uv run main.py` remains available.
 
-- **Intelligent Text Extraction**
-  - Supports both **PDF** and **EPUB** formats.
-  - For PDFs: Skips headers, footers, and page numbers; optionally splits based on Table of Contents (TOC).
-  - For EPUBs: Extracts chapters based on internal HTML structure.
+- Inputs: `.pdf`, `.epub`, `.txt`, `.html`, `.htm`, or a directory of extracted `.txt` chapters.
+- Outputs: WAV by default, MP3, or M4B with chapter markers and EPUB metadata when present.
+- M4B files: the `.m4b` stays in `OUTPUT_DIR`. Intermediate WAV files and resume sidecars stay in `OUTPUT_DIR/chapters/`, including after export. This lets `--resume` reuse them. M4B export requires [FFmpeg](https://ffmpeg.org/download.html) on `PATH`.
+- Device: `auto`, `cpu`, `mps`, or `cuda`. `auto` selects an available accelerator and falls back to CPU.
+- Language: inferred from the voice prefix unless `--lang` is supplied. English voices use `a` or `b`; Spanish voices use `e`. Match the voice to the language.
+- Resume: completed chapters are reused only when the source, settings and audio hashes match. The app writes chapter audio incrementally to limit memory use.
 
-- **Kokoro TTS Integration**
-  - Generate natural-sounding audiobooks with the updated [Kokoro v1.0 model](https://huggingface.co/hexgrad/Kokoro-82M).
-  - Easily select different voicepacks.
+Kokoro also provides French, Hindi, Italian and Brazilian Portuguese voices. Japanese and Mandarin require additional Misaki language dependencies; these are not part of the default installation. See [Kokoro's language documentation](https://github.com/hexgrad/kokoro). Indonesian is not supported by this engine.
 
-- **User-Friendly GUI**
-  - Modern interface built with **ttkbootstrap** (theme selector, scrolled logs, progress bars).
-  - Pause/resume and cancel your audiobook generation anytime.
+English extraction expands common abbreviations and numbers. Other languages preserve those forms for the speech engine. PDF header/footer filtering and chapter detection are heuristic; check the extracted text for unusual layouts.
 
-- **Configurable for Low-VRAM Systems**
-  - Choose the chunk size for text to accommodate limited GPU resources.
-  - Switch to CPU if no GPU is available.
+After extraction, the app records the current chapter files in `.pdf-narrator-chapters.json`. Preview and generation use that list; older chapters and unrelated files stay on disk. Folders without this manifest use all `.txt` files, including `.TXT`.
 
-- **Voice Testing Made Simple**
-  - Test a single voice or loop through all available voices directly from the GUI.
-  - Use the dedicated Voice Test tab to generate and listen to sample audio files.
+The optional `titles` field preserves real chapter titles from the PDF TOC, EPUB TOC or HTML headings. M4B chapter markers use those titles. Older manifests and untitled chapters use `Chapter N`.
 
----
+## NVIDIA acceleration (optional)
 
-## Prerequisites
+On Windows or Linux with a supported NVIDIA GPU and driver, use the CUDA 12.8 PyTorch wheels:
 
-- **Python 3.8+**
-- **FFmpeg** (for audio-related tasks on some systems)
-- **Torch** (PyTorch for the Kokoro TTS model)
-- Other dependencies as listed in `requirements.txt`
+```bash
+uv run --no-default-groups --extra cuda pdf-narrator book.epub --device cuda
+```
 
----
+Use those uv flags each time you want the CUDA environment. Running the default command selects the CPU dependency group again. The wheels include the CUDA runtime; you do not need to install the CUDA Toolkit. You still need a compatible NVIDIA driver. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/) for driver and GPU compatibility. This option is not for macOS; use MPS there.
 
-## Installation 
-> ARM64 MacOS users see the section below
+## Scanned PDFs (optional OCR)
 
-1. **Clone the Repository**
-   ```bash
-   git clone https://github.com/mateogon/pdf-narrator.git
-   cd pdf-narrator
-   ```
+Text PDFs work with the default installation. Scanned PDFs require the OCR extra plus system tools:
 
-2. **Create and Activate a Virtual Environment**
-   ```bash
-   python -m venv venv
-   # On Linux/macOS:
-   source venv/bin/activate
-   # On Windows:
-   venv\Scripts\activate
-   ```
+```bash
+uv run --extra ocr pdf-narrator scanned.pdf
+```
 
-3. **Install Python Dependencies**
-   ```bash
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
+Install Tesseract and Poppler first, and ensure `tesseract`, `pdftocairo` and `pdfinfo` are on `PATH`:
 
----
+- macOS with Homebrew: `brew install tesseract poppler`
+- Ubuntu/Debian: `sudo apt install tesseract-ocr poppler-utils`
+- Windows: install [Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html) and [Poppler](https://pdf2image.readthedocs.io/en/latest/installation.html), then add their executable directories to `PATH`.
 
-## Installation for ARM64 MacOS Users
-1. **Clone the Repository**
-   ```bash
-   git clone https://github.com/mateogon/pdf-narrator.git
-   cd pdf-narrator
-   ```
+The current OCR path uses Tesseract's default language and crops the top and bottom 10% of each page. Check the extraction before generating a full book.
 
-2. **Run the Setup Script to Download Dependencies**
-   ```bash
-   chmod +x scripts/setup_macos_arm64.sh
-   ./scripts/setup_macos_arm64.sh
-   ```
+## Development and verification
 
-3. **Create and Activate the Conda Virtual Environment**
-   ```bash
-   source "$HOME/miniforge3/bin/activate" && conda activate pdf-narrator
-   ```
+```bash
+uv sync --locked --group dev
+uv run --group dev pytest -q
+```
 
----
-## Windows Additional Installation Notes
+Dependencies are declared in `pyproject.toml`; `uv.lock` records the resolved versions. There are no separate requirements files per operating system. The `preshed` compatibility pin prevents an English spaCy tokenizer load failure reproduced on macOS; the other native spaCy dependencies do not need old pins.
 
-For Windows users, some libraries may require extra steps:
+The CI workflow defines CPU tests with Python 3.12 on Ubuntu, Windows and macOS. The runners install FFmpeg; Ubuntu uses Xvfb for native Tk tests. Tests run with Hugging Face offline and do not download Kokoro weights. JUnit results are saved as workflow artifacts. See the [CI runs](https://github.com/mateogon/pdf-narrator/actions/workflows/ci.yml) for current platform results.
 
-### 1. **Prerequisites**
+The renewal was checked locally on Apple Silicon and on Windows 11 with Python 3.12.12 and an RTX 3050. Windows CPU/CUDA CLI synthesis and the test suite passed. The Windows GUI was constructed through SSH with CUDA visible and enabled; its desktop appearance and interactions were not visually reviewed. CI covers CPU behavior; CUDA and MPS synthesis need separate hardware checks.
 
-- **Python 3.12.7**  
-  Download and install [Python 3.12.7](https://www.python.org/downloads/). Ensure `python` and `pip` are added to your system's PATH.
-
-- **CUDA 12.4** (for GPU acceleration)  
-  Install the [CUDA 12.4 Toolkit](https://developer.nvidia.com/cuda-downloads) if you plan to use GPU acceleration.
-
-### 2. **Installing eSpeak NG**
-
-eSpeak NG is required for phoneme-based operations.
-
-1. **Download the Installer**  
-   [eSpeak NG X64 Installer](https://github.com/espeak-ng/espeak-ng/releases/download/1.51/espeak-ng-X64.msi)
-
-2. **Run the Installer**  
-   Follow the on-screen instructions.
-
-3. **Set Environment Variables**  
-   Add the following environment variables:
-
-   - `PHONEMIZER_ESPEAK_LIBRARY` → `C:\Program Files\eSpeak NG\libespeak-ng.dll`
-   - `PHONEMIZER_ESPEAK_PATH` → `C:\Program Files (x86)\eSpeak\command_line\espeak.exe`
-
-   (Right-click "This PC" → Properties → Advanced system settings → Environment Variables)
-
-4. **Verify Installation**
-
-   Open Command Prompt and run:
-
-   ```cmd
-   espeak-ng --version
-   ```
-
-### 3. **Using Precompiled Wheels for DeepSpeed and lxml**
-
-1. **Download Wheels**
-
-   - **DeepSpeed** (for Python 3.12.7, CUDA 12.4): [DeepSpeed Wheel](https://huggingface.co/NM156/deepspeed_wheel/tree/main)
-   - **lxml** (for Python 3.12): [lxml Release](https://github.com/lxml/lxml/releases/tag/lxml-5.3.0)
-
-2. **Install the Wheels**
-
-   Activate your virtual environment and run:
-
-   ```cmd
-   pip install path\to\deepspeed-0.11.2+cuda124-cp312-cp312-win_amd64.whl
-   pip install path\to\lxml-5.3.0-cp312-cp312-win_amd64.whl
-   ```
-
-3. **Verify Installation**
-
-   ```cmd
-   deepspeed --version
-   pip show lxml
-   espeak-ng --version
-   ```
-
----
-## Quick Start
-
-1. **Launch the App**
-   ```bash
-   python main.py
-   ```
-
-2. **Select a Mode**
-   - **Single Book:** Choose a PDF or EPUB file and extract its text.
-   - **Batch Books:** Select a folder with multiple PDFs and/or EPUBs (processes all, preserving folder structure).
-   - **Skip Extraction:** Use pre-extracted text files.
-
-3. **Extract Text**
-   - **PDFs:** Splits into chapters if TOC is available; otherwise, extracts entire document.
-   - **EPUBs:** Extracts chapters based on internal structure.
-
-4. **Configure Kokoro TTS Settings**
-   - Select a voice.
-   - Adjust chunk size and output format (`.wav` or `.mp3`).
-
-5. **Generate Audiobook**
-   - Click Start Process and monitor progress.
-   - Find your audio files in the output folder.
-
----
-
-## Testing Voices
-
-With the latest update, you can now quickly test voices directly within the app:
-
-1. **Navigate to the Voice Test Tab**  
-   In the main window, click on the **Voice Test** tab to access voice testing features.
-
-2. **Enter Sample Text**  
-   Modify or use the default sample text in the provided text area.
-
-3. **Select Test Mode**  
-   - **Test Single Voice:** Pick one voice from the dropdown to generate a sample.
-   - **Test All Available Voices:** Choose this option to automatically generate samples for every available voice.
-
-4. **Run the Test**  
-   Click **Run Voice Test** to start. The app creates a temporary file with your sample text, processes it through Kokoro TTS for each voice (if testing all voices), and saves the output audio files in the designated folder.
-
-5. **Monitor Progress and Listen**  
-   A progress bar and status labels keep you updated. Once the test is complete, you’ll be prompted to open the output folder where you can listen to the generated samples.
-
-6. **Stop the Test if Needed**  
-   If you need to cancel while testing, click **Stop Test** to interrupt the process.
-
----
-
-## Technical Highlights
-
-- **Text Extraction**
-  - PDF: Built on PyMuPDF for efficient parsing, with TOC-based splitting.
-  - EPUB: Extracts text from HTML content files within the EPUB structure.
-
-- **Kokoro TTS**
-  - Advanced text normalization and phonemization.
-  - Splits text into chunks (<510 tokens) and joins audio outputs.
-
----
-
-## Contributing
-
-Fork the repository, create a branch, and submit a pull request.  
-Report bugs or suggest features via Issues.
-
----
+A separate Ubuntu job installs the OCR extra, Tesseract and Poppler, then extracts text from a generated image-only PDF. Locally, this test skips with a reason if the optional dependencies are absent. To require it, set `REQUIRE_OCR=1` and run `uv run --locked --group dev --extra ocr pytest -q tests/test_ocr_integration.py`. The CI job requires OCR and fails if its tools or English language data are missing.
 
 ## License
 
-This project is released under the MIT License (LICENSE.md).
-
----
-
-Enjoy converting your PDFs and EPUBs into immersive audiobooks with Kokoro v1.0 TTS—and now, easily test voices to pick your perfect sound!
+[MIT](LICENSE.md). Kokoro and its model weights have their own [Apache 2.0 license](https://huggingface.co/hexgrad/Kokoro-82M).

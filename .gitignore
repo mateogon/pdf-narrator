@@ -39,6 +39,8 @@ models/**
 
 Kokoro/*.wav
 *.wav
+*.mp3
+*.m4b
 test_text.txt
 
 test_input_kokoro
@@ -50,3 +52,8 @@ voice_tests/*
 
 # Ignore the temporary folder used for voice tests
 voice_test_temp/
+
+*.egg-info/
+.pytest_cache/
+/evaluation/
+/.venv*/

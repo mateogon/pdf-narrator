@@ -1,20 +1,15 @@
-import fitz # PyMuPDF
 import regex as re
 import os
 import sys
 import zipfile
+import json
+from pathlib import Path
 import tempfile
 import time
 import unicodedata # For normalization
 from bs4 import BeautifulSoup # For improved EPUB parsing and HTML extraction
 from num2words import num2words
 import traceback # For detailed error logging if needed
-import pytesseract as tess # image pdfs
-import cv2 ### image pdfs
-from pdf2image import convert_from_path #### image pdfs
-import tika # epubs
-from tika import parser ## epubs
-import numpy as np
 import pymupdf
 
 # --- Configuration ---
@@ -73,45 +68,29 @@ def expand_abbreviations_and_initials(text):
     return text
 
 def convert_numbers(text):
-    """Convert integers and years to words. Leaves decimals and other numbers."""
-    # Replace commas in numbers (thousand separators)
-    text = re.sub(r'(?<=\d),(?=\d)', '', text)
-
+    """Convert English integers, ordinals and years; preserve decimals."""
     def replace_match(match):
-        num_str = match.group(0)
+        number = match.group(1).replace(',', '')
+        suffix = match.group(2)
+        if '.' in number:
+            return match.group(0)
         try:
-            # Handle potential decimals - leave them as digits for now, TTS often handles them well
-            if '.' in num_str:
-                return num_str
-            num = int(num_str)
-            # Year handling (common range)
-            if 1500 <= num <= 2100:
-                # Use 'year' format which typically reads digits (e.g., "nineteen eighty-four")
-                # If you prefer "one thousand nine hundred eighty four", change to 'cardinal'
-                return num2words(num, to='year')
-            # Handle ordinal numbers (e.g., 1st, 2nd) - num2words handles suffixes like 'st'
-            elif match.group(1):
-                 # num2words can convert directly to ordinal words
-                 return num2words(num, to='ordinal')
-            # Default: convert cardinal numbers
-            else:
-                 # Optional: Add threshold? Only convert small numbers?
-                 # if num < 1000: return num2words(num) else: return num_str
-                 return num2words(num)
+            value = int(number)
+            if suffix:
+                return num2words(value, to='ordinal')
+            if 1500 <= value <= 2100:
+                return num2words(value, to='year')
+            return num2words(value)
         except ValueError:
-            return num_str # Return original if not a valid number
+            return match.group(0)
 
-    # Regex to find integers possibly followed by ordinal suffixes (st, nd, rd, th)
-    # We target whole numbers primarily, potentially with ordinal indicators
-    # Make suffix optional and capture it to decide if ordinal conversion is needed
-    pattern = r'\b(\d+)(st|nd|rd|th)?\b'
-    text = re.sub(pattern, replace_match, text)
-    return text
+    pattern = r'(?<![\w.,])([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)(st|nd|rd|th)?(?!\w|[.,][0-9])'
+    return re.sub(pattern, replace_match, text, flags=re.IGNORECASE)
 
 def handle_sentence_ends_and_pauses(text):
     """Ensure sentences end cleanly and handle potential pauses."""
     # Add a space before punctuation if missing (helps TTS parsing)
-    text = re.sub(r'(?<=\w)([.,!?;:])', r' \1', text)
+    text = re.sub(r'(?<=\w)([.,!?;:])(?!\d)', r' \1', text)
     # Normalize multiple spaces
     text = re.sub(r' +', ' ', text)
 
@@ -142,7 +121,7 @@ def handle_sentence_ends_and_pauses(text):
     # Add newline after sentence-ending punctuation for potential TTS break cues
     # Ensure space doesn't exist before newline, add it if needed for clarity.
     # This version adds newline *after* the punctuation and a space.
-    text = re.sub(r'([.!?:])\s*', r'\1\n', text) # Ensures newline separation after sentence ends
+    text = re.sub(r'((?<!\d)[.!?:]|[.!?:](?!\d))\s*', r'\1\n', text) # Ensures newline separation after sentence ends
 
     return text
 
@@ -212,7 +191,7 @@ def basic_html_to_text(html_content):
 
     return text
 
-def clean_pipeline(text):
+def clean_pipeline(text, language='en'):
     """Apply the full cleaning pipeline in order."""
     if not text: return ""
     # print("--- Before clean ---\n", text[:500]) # Debug
@@ -220,11 +199,13 @@ def clean_pipeline(text):
     # print("--- After normalize ---\n", text[:500]) # Debug
     text = join_wrapped_lines(text) # Join lines SHOULD be early
     # print("--- After join lines ---\n", text[:500]) # Debug
-    text = expand_abbreviations_and_initials(text)
+    # These substitutions are English-specific; let Kokoro normalize other languages.
+    if language.lower() in {'a', 'b', 'en', 'en-us', 'en-gb'}:
+        text = expand_abbreviations_and_initials(text)
+        text = convert_numbers(text)
+        text = handle_sentence_ends_and_pauses(text)
     # print("--- After abbreviations ---\n", text[:500]) # Debug
-    text = convert_numbers(text)
     # print("--- After numbers ---\n", text[:500]) # Debug
-    text = handle_sentence_ends_and_pauses(text) # Sentence handling before artifact removal
     # print("--- After sentence ends ---\n", text[:500]) # Debug
     text = remove_artifacts(text)
     # print("--- After artifacts ---\n", text[:500]) # Debug
@@ -252,7 +233,7 @@ def extract_pdf_text_by_page(doc):
         # page_width = page.rect.width # Not currently used but available
 
         # Extract text blocks
-        blocks = page.get_text("blocks", flags=fitz.TEXTFLAGS_TEXT) # Basic flags
+        blocks = page.get_text("blocks", flags=pymupdf.TEXTFLAGS_TEXT) # Basic flags
         filtered_lines = []
         for block in blocks:
             x0, y0, x1, y1, text, *_ = block
@@ -315,22 +296,31 @@ def get_pdf_type(file_path):
     return result
 
 def scanned_pdf(path):
+    """Read scanned pages only when the optional OCR tools are installed."""
+    try:
+        import pytesseract
+        from pdf2image import convert_from_path
+    except ImportError as exc:
+        raise RuntimeError(
+            "Scanned PDF requires OCR: run 'uv run --extra ocr pdf-narrator', then install "
+            "Tesseract and Poppler for your system."
+        ) from exc
+    from shutil import which
+    if not which('tesseract') or not which('pdftocairo') or not which('pdfinfo'):
+        raise RuntimeError(
+            "Scanned PDF requires Tesseract and Poppler on PATH "
+            "(tesseract, pdftocairo and pdfinfo). See README.md."
+        )
     pages = convert_from_path(path, dpi=300, use_pdftocairo=True)
     out = []
     for page in pages:
-        # Convert the page to a NumPy array
-        page_np = np.array(page)  # Correctly convert PpmImageFile to NumPy array
-        height, width = page_np.shape[:2]
-        cropped_img = page_np[int(height * 0.1):int(height * 0.9), :]  # Crop image
-        gray_img = cv2.cvtColor(cropped_img, cv2.COLOR_RGB2GRAY)  # Convert to grayscale
-        _, binary_img = cv2.threshold(gray_img, 200, 255, cv2.THRESH_BINARY)  # Apply threshold
-        text = tess.image_to_string(binary_img, timeout=30)  # OCR extraction
+        width, height = page.size
+        cropped = page.crop((0, int(height * 0.1), width, int(height * 0.9)))
+        binary = cropped.convert('L').point(lambda pixel: 255 if pixel > 200 else 0)
+        text = pytesseract.image_to_string(binary, timeout=30)
         lines = text.splitlines()
-        filtered_lines = [line for line in lines if not line.strip().isdigit() and "copyright" not in line.lower()]
-        filtered_text = " ".join(filtered_lines)
-        out.append(filtered_text)
-    
-    cv2.destroyAllWindows()
+        filtered = [line for line in lines if not line.strip().isdigit() and "copyright" not in line.lower()]
+        out.append(" ".join(filtered))
     return ". ".join(out)
 
 # --- TOC and Chapter Structuring ---
@@ -391,7 +381,7 @@ def remove_overlap(prev_text, curr_text, num_lines=OVERLAP_CHECK_LINES):
     return prev_text
 
 
-def structure_pdf_by_toc(deduplicated_toc, all_pages_text):
+def structure_pdf_by_toc(deduplicated_toc, all_pages_text, language='en'):
     """
     Structures the PDF text into chapters based on TOC page numbers,
     applies cleaning pipeline per chapter, and removes overlap.
@@ -441,7 +431,7 @@ def structure_pdf_by_toc(deduplicated_toc, all_pages_text):
         raw_chapter_text = "\n".join(chapter_pages) # Join pages for the chapter
 
         # Clean the extracted chapter text using the pipeline
-        cleaned_chapter_text = clean_pipeline(raw_chapter_text)
+        cleaned_chapter_text = clean_pipeline(raw_chapter_text, language=language)
 
         # Clean the title
         clean_title = title.strip()
@@ -473,7 +463,7 @@ def structure_pdf_by_toc(deduplicated_toc, all_pages_text):
     return final_chapters
 
 # --- Heuristic Chapter Splitting (Fallback for PDF without TOC) ---
-def split_text_into_heuristic_chapters(full_raw_text):
+def split_text_into_heuristic_chapters(full_raw_text, language='en'):
     """
     Attempts to split raw text into chapters based on heuristics like
     multiple newlines or potential chapter-like headings.
@@ -505,10 +495,11 @@ def split_text_into_heuristic_chapters(full_raw_text):
         if len(trimmed_chunk) > min_chunk_length:
             chapter_count += 1
             # Apply the full cleaning pipeline *to each chunk*
-            cleaned_chunk_text = clean_pipeline(trimmed_chunk)
+            cleaned_chunk_text = clean_pipeline(trimmed_chunk, language=language)
             if cleaned_chunk_text: # Ensure cleaning didn't make it empty
                 chapters.append({
-                    'title': f'Chapter_{chapter_count}', # Generic title
+                    'title': f'Chapter_{chapter_count}', # Generic filename
+                    'display_title': None,
                     'level': None, # No level info available
                     'text': cleaned_chunk_text
                 })
@@ -542,7 +533,7 @@ def split_text_into_heuristic_chapters(full_raw_text):
 
 # --- EPUB Extraction ---
 # ... (Keep parse_epub_content UNCHANGED) ...
-def parse_epub_content(epub_path, progress_callback=None):
+def parse_epub_content(epub_path, progress_callback=None, language='en'):
     """
     Extracts and cleans text content from EPUB using BeautifulSoup.
 
@@ -622,7 +613,7 @@ def parse_epub_content(epub_path, progress_callback=None):
                 try:
                     nav_full_path = os.path.normpath(os.path.join(epub_base_path, nav_href)).replace('\\', '/')
                     nav_content = epub_zip.read(nav_full_path).decode('utf-8', errors='ignore')
-                    nav_soup = BeautifulSoup(nav_content, 'lxml') # Use lxml for potentially complex nav
+                    nav_soup = BeautifulSoup(nav_content, 'xml') # NCX tag names are case-sensitive.
 
                     # EPUB3 Nav: Look for <nav type="toc"> links
                     nav_element = nav_soup.find('nav', {'epub:type': 'toc'}) or nav_soup.find('nav') # Fallback to first nav
@@ -687,13 +678,15 @@ def parse_epub_content(epub_path, progress_callback=None):
                     # Extract text using BeautifulSoup
                     raw_text = basic_html_to_text(html_content)
                     # Apply full cleaning pipeline
-                    cleaned_text = clean_pipeline(raw_text)
+                    cleaned_text = clean_pipeline(raw_text, language=language)
 
                     if cleaned_text: # Only add chapter if it has content
                          # Use TOC title if available, otherwise fallback to filename
-                         chapter_title = toc_map.get(content_path, os.path.basename(relative_href))
+                         real_title = toc_map.get(content_path) or _html_chapter_title(html_content)
+                         chapter_title = real_title or os.path.basename(relative_href)
                          chapters.append({
                              'title': chapter_title,
+                             'display_title': real_title,
                              'text': cleaned_text
                          })
                          extracted_files_count += 1
@@ -720,6 +713,12 @@ def parse_epub_content(epub_path, progress_callback=None):
 
     return chapters
 
+def _html_chapter_title(html_content):
+    """Read a heading as metadata, without turning the filename into a title."""
+    heading = BeautifulSoup(html_content, 'html.parser').find(['h1', 'h2', 'h3'])
+    return heading.get_text(' ', strip=True) if heading is not None else None
+
+
 # --- TXT Extraction ---
 def extract_txt(path):
     with open(path, 'r', encoding="utf-8", errors="ignore") as fin:
@@ -727,13 +726,96 @@ def extract_txt(path):
     return str(out)
 
 # --- Saving Functions ---
-# ... (Keep save_chapters_generic, save_whole_book_text UNCHANGED) ...
-def save_chapters_generic(chapters, book_name, output_dir):
+EXTRACTION_MANIFEST = '.pdf-narrator-chapters.json'
+
+
+def _manifest_chapter_path(directory, name):
+    """Reject paths that could select files outside this extraction directory."""
+    if not isinstance(name, str):
+        raise ValueError("Invalid extraction manifest: chapter paths must be basenames.")
+    if not name or any(separator in name for separator in ('/', '\\', ':', '\0')):
+        raise ValueError("Invalid extraction manifest: chapter paths must be basenames.")
+    if Path(name).suffix.lower() != '.txt':
+        raise ValueError("Invalid extraction manifest: chapter paths must be .txt basenames.")
+    chapter = directory / name
+    if chapter.resolve().parent != directory or not chapter.is_file():
+        raise ValueError(f"Invalid extraction manifest: chapter is missing or outside the directory: {name!r}")
+    return str(chapter)
+
+
+def extracted_chapter_paths(directory):
+    """Return this extraction's chapters, or all text files in a manual folder."""
+    directory = Path(directory).resolve()
+    if not directory.is_dir():
+        raise ValueError(f"Chapter directory does not exist: {directory}")
+    manifest = directory / EXTRACTION_MANIFEST
+    if not manifest.exists() and not manifest.is_symlink():
+        return [str(path) for path in sorted(directory.iterdir())
+                if path.is_file() and path.suffix.lower() == '.txt']
+    data = _read_extraction_manifest(manifest)
+    paths = [_manifest_chapter_path(directory, name) for name in data['chapters']]
+    if len(paths) != len(set(paths)):
+        raise ValueError(f"Invalid extraction manifest: duplicate chapters: {manifest}")
+    return paths
+
+
+def _read_extraction_manifest(manifest):
+    """Validate the persisted file-list contract before selecting chapters."""
+    try:
+        data = json.loads(manifest.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Invalid extraction manifest: {manifest}") from exc
+    if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('chapters'), list):
+        raise ValueError(f"Invalid extraction manifest schema: {manifest}")
+    _manifest_chapter_titles(data)
+    return data
+
+
+def _manifest_chapter_titles(data):
+    titles = data.get('titles', {})
+    if not isinstance(titles, dict):
+        raise ValueError('Invalid extraction manifest: titles must be a mapping.')
+    for name, title in titles.items():
+        if name not in data['chapters'] or not isinstance(title, str) or not title.strip():
+            raise ValueError('Invalid extraction manifest: titles must name current chapters and contain text.')
+    return titles
+
+
+def extracted_chapter_titles(directory):
+    """Return real titles keyed by chapter basename; older/manual folders have none."""
+    extracted_chapter_paths(directory)
+    manifest = Path(directory) / EXTRACTION_MANIFEST
+    if not manifest.exists():
+        return {}
+    return _manifest_chapter_titles(_read_extraction_manifest(manifest))
+
+
+def _write_extraction_manifest(directory, paths, chapter_titles=None):
+    """Publish current files and optional real titles without deleting older files."""
+    manifest = Path(directory) / EXTRACTION_MANIFEST
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory,
+                                         prefix='.pdf-narrator-chapters-', suffix='.tmp', delete=False) as temporary:
+            temporary_path = temporary.name
+            data = {'version': 1, 'chapters': [Path(path).name for path in paths]}
+            if chapter_titles:
+                data['titles'] = chapter_titles
+            json.dump(data, temporary)
+            temporary.write('\n')
+        os.replace(temporary_path, manifest)
+    finally:
+        if temporary_path is not None:
+            Path(temporary_path).unlink(missing_ok=True)
+
+
+def save_chapters_generic(chapters, book_name, output_dir, chapter_titles=None):
     """Saves chapters (list of dicts with 'title', 'text') to files."""
     if not chapters:
         print("  No chapters found or extracted to save.")
-        return
+        return []
     os.makedirs(output_dir, exist_ok=True)
+    written_paths = []
     num_chapters = len(chapters)
     padding = len(str(num_chapters))
     print(f"  Saving {num_chapters} chapters to '{output_dir}'...")
@@ -742,7 +824,7 @@ def save_chapters_generic(chapters, book_name, output_dir):
         # Title can come from TOC (PDF/EPUB) or filename (EPUB fallback)
         # Level might exist for PDF chapters
         level = chapter.get('level', None) # Get level if available
-        title = chapter.get('title', f'Chapter_{idx}')
+        title = chapter.get('title') or f'Chapter_{idx}'
         text = chapter.get('text', '')
 
         # Create a safer filename from the title
@@ -757,35 +839,36 @@ def save_chapters_generic(chapters, book_name, output_dir):
         level_prefix = f"L{level}_" if level is not None else ""
         filename = f"{str(idx).zfill(padding)}_{level_prefix}{safe_title}.txt"
         filepath = os.path.join(output_dir, filename)
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(text)
-        except Exception as e:
-            print(f"    Error saving chapter '{filename}': {e}")
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(text)
+        written_paths.append(filepath)
+        real_title = (chapter.get('display_title', chapter.get('title')) or '').strip()
+        if chapter_titles is not None and real_title:
+            chapter_titles[filename] = real_title
 
     print(f"  Finished saving chapters.")
+    return written_paths
 
-def save_whole_book_text(full_text, book_name, output_dir):
+def save_whole_book_text(full_text, book_name, output_dir, language='en'):
     """Cleans and saves the entire book text to a single file."""
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"{book_name}_full_text.txt")
     print(f"  Cleaning full text...")
-    cleaned_full_text = clean_pipeline(full_text) # Apply cleaning pipeline
+    cleaned_full_text = clean_pipeline(full_text, language=language) # Apply cleaning pipeline
     print(f"  Saving full text to '{output_file}'...")
-    try:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(cleaned_full_text)
-        print(f"  Full text saved.")
-    except Exception as e:
-        print(f"  Error saving full text: {e}")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(cleaned_full_text)
+    print(f"  Full text saved.")
+    return [output_file]
 
 
 # --- Main Extraction Function ---
 
-def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="extracted_books", progress_callback=None):
+def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="extracted_books", progress_callback=None, language="en"):
     """
     Extracts text from PDF or EPUB files, cleans it, and saves chapters or whole text
-    directly into the specified output_dir.
+    directly into the specified output_dir. A successful run atomically records
+    its exact files in the extraction manifest; older and unrelated files remain.
 
     Args:
         file_path (str): Path to the input PDF or EPUB file.
@@ -797,6 +880,8 @@ def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="e
                               Uses TOC if available (PDF), spine order (EPUB), or
                               heuristic splitting (PDF fallback).
                             - 'whole': Saves the entire cleaned text into a single file.
+        language (str): English defaults to normalization of numbers and abbreviations.
+                        Other languages preserve them for the TTS engine.
         output_dir (str): The directory where the output file(s) will be saved.
                           The function will create this directory if it doesn't exist.
                           A subdirectory named after the book might be implicitly created
@@ -833,6 +918,8 @@ def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="e
     print(f"    Use TOC                : {use_toc}")
     print(f"    Extraction Mode        : {extract_mode}")
 
+    written_paths = []
+    chapter_titles = {}
     try:
         if file_ext == '.pdf':
             print("  Processing PDF file...")
@@ -846,13 +933,14 @@ def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="e
                 doc = scanned_pdf(file_path)
                 print("  Performed OCR on scanned PDF.")
                 if progress_callback: progress_callback(70)
-                save_whole_book_text(doc, safe_book_name, absolute_output_dir)
+                written_paths = save_whole_book_text(doc, safe_book_name, absolute_output_dir, language=language)
+                _write_extraction_manifest(absolute_output_dir, written_paths, chapter_titles)
                 if progress_callback: progress_callback(100)
                 elapsed_time = time.time() - start_time
                 print(f"--- Extraction completed in {elapsed_time:.2f} seconds ---")
                 return absolute_output_dir
 
-            doc = fitz.open(file_path)
+            doc = pymupdf.open(file_path)
             print(f"  Opened PDF. Pages: {len(doc)}")
 
             if progress_callback: progress_callback(10)
@@ -872,7 +960,7 @@ def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="e
                 if use_toc and dedup_toc:
                     print("  Attempting to structure PDF by TOC...")
                     if progress_callback: progress_callback(50)
-                    pdf_chapters = structure_pdf_by_toc(dedup_toc, all_pages_text)
+                    pdf_chapters = structure_pdf_by_toc(dedup_toc, all_pages_text, language=language)
                     if progress_callback: progress_callback(85)
                     if pdf_chapters:
                         toc_used = True
@@ -887,24 +975,24 @@ def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="e
                 if not toc_used:
                     if progress_callback: progress_callback(50) # Show progress for heuristic attempt
                     full_raw_text = "\n".join(all_pages_text) # Combine raw pages
-                    pdf_chapters = split_text_into_heuristic_chapters(full_raw_text)
+                    pdf_chapters = split_text_into_heuristic_chapters(full_raw_text, language=language)
                     if progress_callback: progress_callback(85)
 
                 # --- Save Chapters (if found by either method) ---
                 if pdf_chapters:
-                    save_chapters_generic(pdf_chapters, safe_book_name, absolute_output_dir)
+                    written_paths = save_chapters_generic(pdf_chapters, safe_book_name, absolute_output_dir, chapter_titles=chapter_titles)
                 else:
                     # If STILL no chapters after TOC and heuristic, save as whole
                     print("  No chapters found via TOC or heuristics. Saving as whole book text.")
                     full_raw_text = "\n".join(all_pages_text) # Combine raw pages again (splitter might have failed)
-                    save_whole_book_text(full_raw_text, safe_book_name, absolute_output_dir) # save_whole cleans the text
+                    written_paths = save_whole_book_text(full_raw_text, safe_book_name, absolute_output_dir, language=language) # save_whole cleans the text
 
             # --- Whole Book Mode ---
             else: # extract_mode == "whole"
                 print("  Saving PDF as whole book text.")
                 if progress_callback: progress_callback(60)
                 full_text = "\n".join(all_pages_text) # Join all pages extracted earlier
-                save_whole_book_text(full_text, safe_book_name, absolute_output_dir) # save_whole cleans the text
+                written_paths = save_whole_book_text(full_text, safe_book_name, absolute_output_dir, language=language) # save_whole cleans the text
 
             doc.close()
             if progress_callback: progress_callback(95)
@@ -912,14 +1000,14 @@ def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="e
         elif file_ext == '.epub':
             # --- EPUB Processing (largely unchanged) ---
             print("  Processing EPUB file...")
-            epub_chapters = parse_epub_content(file_path, progress_callback)
+            epub_chapters = parse_epub_content(file_path, progress_callback, language=language)
 
             if not epub_chapters:
                  print("  Warning: No content extracted from EPUB.")
 
             if extract_mode == "chapters":
                  if epub_chapters:
-                     save_chapters_generic(epub_chapters, safe_book_name, absolute_output_dir)
+                     written_paths = save_chapters_generic(epub_chapters, safe_book_name, absolute_output_dir, chapter_titles=chapter_titles)
                  else:
                      print("  No EPUB chapters extracted, nothing to save in chapter mode.")
             else: # extract_mode == "whole"
@@ -927,7 +1015,7 @@ def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="e
                      print("  Combining EPUB chapters into whole book text...")
                      # Join chapters with double newline for paragraph separation between files
                      full_text = "\n\n".join([chap['text'] for chap in epub_chapters if chap.get('text')])
-                     save_whole_book_text(full_text, safe_book_name, absolute_output_dir) # save_whole cleans the text
+                     written_paths = save_whole_book_text(full_text, safe_book_name, absolute_output_dir, language=language) # save_whole cleans the text
                  else:
                       print("  No EPUB content extracted, nothing to save in whole book mode.")
 
@@ -935,24 +1023,26 @@ def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="e
             print("  Processing TXT file...")
             txt_content = extract_txt(file_path)
             if extract_mode == "whole":
-                save_whole_book_text(txt_content, safe_book_name, absolute_output_dir)
+                written_paths = save_whole_book_text(txt_content, safe_book_name, absolute_output_dir, language=language)
             else:
                 # For TXT in chapter mode, just save as one chapter
-                chapter = {'title': 'Full_Text', 'text': clean_pipeline(txt_content)}
-                save_chapters_generic([chapter], safe_book_name, absolute_output_dir)
+                chapter = {'title': 'Full_Text', 'display_title': None, 'text': clean_pipeline(txt_content, language=language)}
+                written_paths = save_chapters_generic([chapter], safe_book_name, absolute_output_dir, chapter_titles=chapter_titles)
 
         elif file_ext == '.html' or file_ext == '.htm':
             print("  Processing HTML file...")
-            content = basic_html_to_text(open(file_path, 'r', encoding='utf-8', errors='ignore').read())
+            html_content = Path(file_path).read_text(encoding='utf-8', errors='ignore')
+            content = basic_html_to_text(html_content)
             if extract_mode == "whole":
-                save_whole_book_text(content, safe_book_name, absolute_output_dir)
+                written_paths = save_whole_book_text(content, safe_book_name, absolute_output_dir, language=language)
             else:
-                chapter = {'title': 'Full_Text', 'text': clean_pipeline(content)}
-                save_chapters_generic([chapter], safe_book_name, absolute_output_dir)
+                chapter = {'title': 'Full_Text', 'display_title': _html_chapter_title(html_content), 'text': clean_pipeline(content, language=language)}
+                written_paths = save_chapters_generic([chapter], safe_book_name, absolute_output_dir, chapter_titles=chapter_titles)
 
         else:
             raise ValueError(f"Unsupported file format: '{file_ext}'. Supported: .pdf, .epub, .txt, .html, .htm")
 
+        _write_extraction_manifest(absolute_output_dir, written_paths, chapter_titles)
         elapsed_time = time.time() - start_time
         print(f"--- Extraction completed in {elapsed_time:.2f} seconds ---")
         if progress_callback: progress_callback(100)
@@ -963,6 +1053,7 @@ def extract_book(file_path, use_toc=True, extract_mode="chapters", output_dir="e
         traceback.print_exc() # Print full traceback for easier debugging
         if progress_callback: progress_callback(None) # Indicate error
         raise # Re-raise the exception
+
 
 # --- Example Usage (commented out) ---
 '''

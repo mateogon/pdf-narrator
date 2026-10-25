@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: ['codex/**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  HF_HUB_OFFLINE: '1'
+  UV_PYTHON_DOWNLOADS: never
+
+jobs:
+  tests:
+    name: Python 3.12 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # setup-python supplies Tk, including on Windows and macOS.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Install Linux test tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg xvfb xauth python3-tk
+      - name: Install macOS test tools
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install Windows test tools
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --yes --no-progress
+      - name: Check lock and install CPU dependencies
+        run: |
+          uv lock --check
+          uv sync --locked --group dev
+      - name: Check audio tools
+        run: |
+          ffmpeg -version
+          ffprobe -version
+      - name: Test with native Tk under Xvfb
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a uv run --locked --group dev python -c "import tkinter; root = tkinter.Tk(); root.destroy()"
+          xvfb-run -a uv run --locked --group dev pytest -q -ra --junitxml=pytest-results.xml
+      - name: Test with native Tk
+        if: runner.os != 'Linux'
+        run: |
+          uv run --locked --group dev python -c "import tkinter; root = tkinter.Tk(); root.destroy()"
+          uv run --locked --group dev pytest -q -ra --junitxml=pytest-results.xml
+      - name: Save test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pytest-${{ matrix.os }}
+          path: pytest-results.xml
+
+  ocr:
+    name: Real OCR (Ubuntu)
+    runs-on: ubuntu-latest
+    env:
+      REQUIRE_OCR: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Install OCR tools
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-eng poppler-utils
+      - name: Check lock and install OCR dependencies
+        run: |
+          uv lock --check
+          uv sync --locked --group dev --extra ocr
+      - name: Check OCR prerequisites
+        run: |
+          tesseract --version
+          pdftocairo -v
+          pdfinfo -v
+          uv run --locked --group dev --extra ocr python -c "import pdf2image, pytesseract; assert 'eng' in pytesseract.get_languages(), 'Tesseract English data is missing'"
+      - name: Extract an image-only PDF with real OCR
+        run: uv run --locked --group dev --extra ocr pytest -q -ra tests/test_ocr_integration.py --junitxml=pytest-ocr-results.xml
+      - name: Save OCR test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pytest-ocr
+          path: pytest-ocr-results.xml
