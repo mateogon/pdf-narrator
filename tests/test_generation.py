@@ -26,7 +26,7 @@ class GenerationTests(unittest.TestCase):
 
     def test_streams_chunks_filters_punctuation_and_detaches_tensor(self):
         def pipeline(text, **kwargs):
-            self.assertEqual(text, "Hello.\nWorld!")
+            self.assertEqual(text, "Hello. World!")
             yield "Hello", "", torch.ones(100, requires_grad=True) * 0.2
             yield "***", "", np.ones(1000)
             yield "World", "", np.ones(200) * 2
@@ -35,6 +35,15 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual((len(audio), rate), (300, 24000))
         self.assertAlmostEqual(audio[0], 0.2, places=4)
         self.assertLessEqual(audio.max(), 1)
+
+    def test_speech_blocks_join_sentences_and_keep_paragraphs(self):
+        sentence = "The swallow flew over the city at night ."
+        text = "\n".join([sentence] * 30) + "\n\nA new paragraph starts here .\n\"\n"
+        blocks = generation.speech_blocks(text, limit=200).split("\n")
+        self.assertTrue(all(len(block) <= 200 for block in blocks))
+        self.assertEqual(blocks[-1], "A new paragraph starts here .")
+        self.assertEqual(sum(block.count(sentence) for block in blocks), 30)
+        self.assertEqual(generation.speech_blocks("\"\n***\n"), "")
 
     def test_failure_and_cancel_preserve_previous_output(self):
         self.output.write_bytes(b"previous audio")

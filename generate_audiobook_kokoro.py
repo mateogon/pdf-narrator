@@ -17,6 +17,7 @@ import torch
 from kokoro import KPipeline
 
 DEFAULT_SAMPLE_RATE = 24000
+SPEECH_BLOCK_CHARS = 450
 MODEL_REPO = "hexgrad/Kokoro-82M"
 DEVICE = "auto"
 
@@ -84,6 +85,30 @@ def _spoken_text(text):
     return bool(re.search(r"[^\W_]", text or "", re.UNICODE))
 
 
+def speech_blocks(text, limit=SPEECH_BLOCK_CHARS):
+    """Join extracted lines into paragraph-sized blocks, one per line.
+
+    Extraction leaves about one sentence per line. Sending each sentence to Kokoro
+    separately is ~5x slower and adds a pause after every sentence, so lines are
+    joined up to `limit` characters; blank lines still end a paragraph.
+    """
+    blocks = []
+    for paragraph in re.split(r"\n\s*\n", text):
+        current = ""
+        for line in paragraph.splitlines():
+            line = line.strip()
+            if not _spoken_text(line):
+                continue
+            if current and len(current) + 1 + len(line) > limit:
+                blocks.append(current)
+                current = line
+            else:
+                current = f"{current} {line}" if current else line
+        if current:
+            blocks.append(current)
+    return "\n".join(blocks)
+
+
 def _audio_array(audio):
     if audio is None:
         return None
@@ -132,7 +157,7 @@ def generate_audio_for_file_kokoro(input_path, pipeline, voice, output_path,
     temporary = None
     try:
         text = Path(input_path).read_text(encoding="utf-8")
-        text = "\n".join(line for line in text.splitlines() if _spoken_text(line))
+        text = speech_blocks(text)
         if not _spoken_text(text):
             raise ValueError("Input contains no letters or digits.")
         destination = Path(output_path)

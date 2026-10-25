@@ -21,6 +21,9 @@ def _parser():
     parser.add_argument("--resume", action="store_true", help="Reuse chapters only when source/settings/audio hashes match")
     parser.add_argument("--title")
     parser.add_argument("--author")
+    parser.add_argument("--ui", choices=["desktop", "classic"], default="desktop",
+                        help="Without an input file: open the desktop app, or the classic Tk window")
+    parser.add_argument("--dev", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -77,6 +80,9 @@ def _export(args, source, output_dir, audio_files, temporary, chapters):
 def main(argv=None):
     args = _parser().parse_args(argv)
     if args.input is None:
+        if args.ui == "desktop":
+            from webui.app import run
+            return run(dev=args.dev)
         from ui import AudiobookApp
         AudiobookApp().mainloop()
         return 0
