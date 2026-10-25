@@ -1,9 +1,6 @@
-# main.py
-import ttkbootstrap as tb
-from ui import AudiobookApp
-def main():
-    app = AudiobookApp()
-    app.mainloop()
+"""Backward-compatible launcher for the desktop app and CLI."""
+
+from cli import main
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
