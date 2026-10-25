@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-narrator"
+version = "0.2.0"
+description = "Convert PDF, EPUB, TXT and HTML books into audiobooks with local Kokoro TTS"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = "MIT"
+dependencies = [
+    "beautifulsoup4>=4.12,<5",
+    "en-core-web-sm",
+    "kokoro>=0.9.4,<0.10",
+    "lxml>=5,<7",
+    "num2words>=0.5.14,<0.6",
+    "numpy>=1.26,<3",
+    "pillow>=10,<13",
+    "pymupdf>=1.25,<2",
+    # preshed 3.0.14 overflows when spaCy loads the English tokenizer on macOS.
+    "preshed==3.0.9",
+    "spacy>=3.8.16,<3.9",
+    "regex>=2024.11.6",
+    "soundfile>=0.13,<1",
+    "torch>=2.6,<3",
+    "ttkbootstrap>=1.10,<2",
+]
+
+[project.optional-dependencies]
+ocr = ["pdf2image>=1.17,<2", "pytesseract>=0.3.13,<0.4"]
+cuda = ["torch>=2.6,<3; sys_platform == 'linux' or sys_platform == 'win32'"]
+
+[project.scripts]
+pdf-narrator = "cli:main"
+
+[dependency-groups]
+cpu = ["torch>=2.6,<3"]
+dev = ["pytest>=8,<10"]
+
+[tool.setuptools]
+py-modules = ["audiobook_export", "cli", "extract", "generate_audiobook_kokoro", "main", "ui"]
+
+[tool.uv]
+default-groups = ["cpu"]
+conflicts = [[{ group = "cpu" }, { extra = "cuda" }]]
+
+[tool.uv.sources]
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+torch = [
+    { index = "pytorch-cpu", group = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", extra = "cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
