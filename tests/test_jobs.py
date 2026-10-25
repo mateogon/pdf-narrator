@@ -34,7 +34,7 @@ def _fake_generate(calls, gate=None):
     return generate
 
 
-def _wait_idle(service, timeout=20):
+def _wait_idle(service, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         snapshot = service.snapshot()

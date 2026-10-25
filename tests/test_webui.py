@@ -67,15 +67,16 @@ def _api(tmp_path):
     settings = Settings(tmp_path / "settings.json")
     media = MediaServer(lambda: library.root)
     jobs = JobService(library, settings, resolve_device=lambda device: "cpu")
-    return library, jobs, Api(library, settings, jobs, media)
+    return library, jobs, Api(library, settings, jobs, media, detect_devices=False)
 
 
 def _imported(tmp_path, library, jobs, api):
     source = tmp_path / "book.txt"
     source.write_text(TEXT, encoding="utf-8")
     [book_id] = api.import_paths([str(source)])
-    deadline = time.time() + 10
-    while (jobs.snapshot()["active"] or jobs.snapshot()["queued"]) and time.time() < deadline:
+    deadline = time.time() + 60
+    while jobs.snapshot()["active"] or jobs.snapshot()["queued"]:
+        assert time.time() < deadline, "import job did not finish"
         time.sleep(0.02)
     return book_id
 

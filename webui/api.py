@@ -26,14 +26,18 @@ def _display_path(path):
 
 
 class Api:
-    def __init__(self, library, settings, jobs, server):
+    def __init__(self, library, settings, jobs, server, detect_devices=True):
         self._library = library
         self._settings = settings
         self._jobs = jobs
         self._server = server
         self._window = None
         self._devices = None
-        threading.Thread(target=self._detect_devices, daemon=True).start()
+        if detect_devices:
+            # Importing torch takes seconds; do it off the UI path.
+            threading.Thread(target=self._detect_devices, daemon=True).start()
+        else:
+            self._devices = ["cpu"]
 
     # --- overview -------------------------------------------------------------------
 
