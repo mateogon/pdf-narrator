@@ -140,6 +140,7 @@ function render() {
 
 function renderLive() {
   // Refresh only parts without user input, so typing and sliders are never interrupted.
+  applyTheme();
   const nav = $(".nav");
   if (nav) nav.outerHTML = navHtml();
   if (S.view === "library" || S.view === "queue" || (S.view === "book" && (S.stage === "create" || S.stage === "export"))) {
@@ -214,7 +215,7 @@ function bookHeadHtml(book) {
     <div class="bhead">
       <button class="icon-btn" data-act="nav" data-view="library" title="Back to library">${icon("left")}</button>
       ${coverHtml(book, "lg")}
-      <div class="grow"><h1>${esc(book.title)}</h1><div class="muted">${[book.author, book.format.toUpperCase(), lang, s ? plural(s.total, "section") : "", s ? `~${s.words.toLocaleString()} words` : ""].filter(Boolean).map(esc).join(" · ")}</div></div>
+      <div class="grow"><h1>${esc(book.title)}</h1><div class="muted">${[book.author, book.format.toUpperCase(), lang, s ? plural(s.total, "section") : "", s ? `~${s.words.toLocaleString("en-US")} words` : ""].filter(Boolean).map(esc).join(" · ")}</div></div>
       <div class="acts"><button class="btn" data-act="details">${icon("edit")}Book details</button></div>
     </div>
     <div class="pipe">
@@ -428,7 +429,7 @@ function createStage(book) {
     <div class="card stat"><div class="k">${icon("list")}Chapters done</div><div class="v">${s.done} <span class="muted" style="font-size:16px">/ ${s.included}</span></div><div class="pbar" style="margin-top:10px"><i style="width:${pct}%"></i></div></div>
     <div class="card stat"><div class="k">${icon("clock")}Time remaining</div><div class="v">${mine?.seconds_left ? fmtDur(mine.seconds_left) : pending ? "—" : "Done"}</div><div class="s">${mine?.seconds_left ? "Done around " + new Date(Date.now() + mine.seconds_left * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : mine ? "Measuring…" : pending ? "Starts when you create" : "Every chapter is ready"}</div></div>
     <div class="card stat"><div class="k">${icon("zap")}Speed</div><div class="v">${mine?.speed_ratio ? Math.round(mine.speed_ratio) + "×" : "—"}</div><div class="s">${mine?.speed_ratio ? "faster than listening" : esc(S.overview?.processor?.label || "")}</div></div>
-    <div class="card stat"><div class="k">${icon("headph")}Audiobook length</div><div class="v">${fmtDur(s.seconds)}</div><div class="s">~${s.words.toLocaleString()} words</div></div>
+    <div class="card stat"><div class="k">${icon("headph")}Audiobook length</div><div class="v">${fmtDur(s.seconds)}</div><div class="s">~${s.words.toLocaleString("en-US")} words</div></div>
   </div>
   <div class="ggrid">
     <div class="card">
@@ -473,7 +474,7 @@ function exportStage(book) {
     </div>
     <div class="card panel"><h2>Finished file</h2>
       ${book.export ? `<div class="row" style="margin-bottom:12px"><span class="badge b-ok">${icon("check", 12)}${book.export.format.toUpperCase()}</span><span class="small" style="word-break:break-all">${esc(book.export.name)}</span></div>
-        <div class="muted small" style="margin-bottom:14px">Exported ${new Date(book.export.created_at * 1000).toLocaleString()}</div>
+        <div class="muted small" style="margin-bottom:14px">Exported ${new Date(book.export.created_at * 1000).toLocaleString("en-US")}</div>
         <button class="btn" data-act="reveal" data-which="export">${icon("folder")}Show file</button>`
       : `<div class="muted small">Your exported audiobook will appear here.</div>`}
     </div>

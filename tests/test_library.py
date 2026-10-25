@@ -105,6 +105,19 @@ def test_remove_line_drops_repeated_headers(tmp_path):
     assert "PRIDE AND PREJUDICE" not in library.chapter_text(library.get(book["id"]), chapter_id)
 
 
+def test_header_tip_ignores_single_words_and_sentences():
+    text = "\n".join(["You", "Swallow, little Swallow,", "Real sentence one."] * 5)
+    assert repeated_lines(text) == []
+    assert repeated_lines("\n".join(["PRIDE", "Body text here."] * 4))[0]["line"] == "PRIDE"
+
+
+def test_standard_ebooks_front_matter_is_skipped(tmp_path):
+    library, book = _book_with_chapters(tmp_path, [
+        ("Titlepage", "Pride and Prejudice " * 30), ("Uncopyright", "Public domain. " * 40), ("XIV", ENGLISH)])
+    assert [chapter["included"] for chapter in book["chapters"]] == [False, False, True]
+    assert book["chapters"][2]["title"] == "Chapter XIV"
+
+
 def test_detect_language():
     assert detect_language(ENGLISH) == "a"
     assert detect_language(SPANISH) == "e"

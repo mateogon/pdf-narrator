@@ -135,7 +135,8 @@ def test_export_requires_all_chapters_and_writes_record(tmp_path):
     service.submit("export", book["id"], format="m4b")
     _wait_idle(service)
     book = library.get(book["id"])
-    assert book["export"]["format"] == "m4b" and Path(book["export"]["path"]).is_file()
+    assert book["export"]["format"] == "m4b" and not Path(book["export"]["path"]).is_absolute()
+    assert (library.book_dir(book["id"]) / book["export"]["path"]).is_file()
     assert len(exported[0][0]) == library.summary(book)["included"]
 
 
@@ -145,7 +146,7 @@ def test_mp3_export_writes_one_file_per_chapter(tmp_path):
     service.submit("create", book["id"])
     service.submit("export", book["id"], format="mp3")
     _wait_idle(service)
-    folder = Path(library.get(book["id"])["export"]["path"])
+    folder = library.book_dir(book["id"]) / library.get(book["id"])["export"]["path"]
     assert len(list(folder.glob("*.mp3"))) == library.summary(library.get(book["id"]))["included"]
 
 

@@ -17,6 +17,14 @@ from library import SUPPORTED_SUFFIXES, count_words, estimated_seconds, repeated
 ENGLISH = {"a", "b"}
 
 
+def _display_path(path):
+    """Show paths under the home folder as ~/…"""
+    try:
+        return "~/" + Path(path).relative_to(Path.home()).as_posix()
+    except ValueError:
+        return str(path)
+
+
 class Api:
     def __init__(self, library, settings, jobs, server):
         self._library = library
@@ -57,7 +65,7 @@ class Api:
         return dict(self._card(book), chapters=chapters, speed=book["speed"], voice=book["voice"],
                     language=book["language"], source_name=book["source_name"],
                     export=dict(export, name=Path(export["path"]).name) if export else None,
-                    folder=str(self._library.book_dir(book_id)))
+                    folder=_display_path(self._library.book_dir(book_id)))
 
     def voices(self, language):
         if language not in voices.LANGUAGES:
@@ -243,7 +251,7 @@ class Api:
     def reveal(self, book_id, which="folder"):
         book = self._library.get(book_id)
         folder = self._library.book_dir(book_id)
-        target = Path(book["export"]["path"]) if which == "export" and book.get("export") else folder
+        target = folder / book["export"]["path"] if which == "export" and book.get("export") else folder
         if not target.exists():
             target = folder
         if sys.platform == "darwin":

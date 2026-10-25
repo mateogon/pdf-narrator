@@ -28,7 +28,7 @@ SUPPORTED_SUFFIXES = {".pdf", ".epub", ".txt", ".html", ".htm"}
 WORDS_PER_MINUTE = 200  # Kokoro at 1.0x, measured on English prose
 # Sections that people rarely want narrated. Matched against chapter titles.
 FRONT_MATTER = re.compile(
-    r"^\s*(cover|title page|half title|copyright|contents|table of contents|dedication|"
+    r"^\s*(cover|title ?page|half title|(un)?copyright|contents|table of contents|dedication|"
     r"also by|imprint|colophon|index|about the publisher)\b"
     r"|project gutenberg|gutenberg license|full license", re.IGNORECASE)
 MIN_NARRATED_WORDS = 40
@@ -39,6 +39,8 @@ def default_library_root():
 
 
 def config_dir():
+    if os.environ.get("PDF_NARRATOR_CONFIG_DIR"):
+        return Path(os.environ["PDF_NARRATOR_CONFIG_DIR"])
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "PDF Narrator"
     if sys.platform == "win32":
@@ -195,7 +197,8 @@ def repeated_lines(text, minimum=3):
     """Short repeated lines without sentence punctuation: usually running page headers."""
     lines = [line.strip() for line in text.splitlines()]
     counts = Counter(line for line in lines if 3 <= len(line) <= 60 and len(line.split()) <= 8
-                     and _has_letters(line) and not re.search(r"[.!?,;:\"“”]\s*$", line))
+                     and _has_letters(line) and not re.search(r"[.!?,;:\"“”]\s*$", line)
+                     and (len(line.split()) >= 2 or line.isupper()))
     return [{"line": line, "count": count} for line, count in counts.most_common(5) if count >= minimum]
 
 
@@ -312,6 +315,8 @@ class Library:
             text = path.read_text(encoding="utf-8")
             title = (titles.get(path.stem) or _title_from_text(text) or f"Chapter {index}").strip()
             title = re.sub(r"(?<![A-Z][a-z])\.$", "", title) or f"Chapter {index}"
+            if re.fullmatch(r"[IVXLCDM]+|\d+", title):
+                title = f"Chapter {title}"  # some editions title chapters with a bare numeral
             words = count_words(text)
             chapters.append({
                 "id": path.stem, "file": path.name, "title": title, "words": words,

@@ -13,8 +13,8 @@ def run(dev=False):
         import webview
         from webview.dom import DOMEventHandler
     except ImportError as error:
-        print("The desktop app needs pywebview and a system WebView "
-              "(on Linux: WebKitGTK, e.g. 'sudo apt install gir1.2-webkit2-4.1 python3-gi').\n"
+        print("The desktop app needs pywebview and a system web view. On Linux, install WebKitGTK "
+              "and start with: uv run --with \"pywebview[gtk]\" pdf-narrator (see README, Install).\n"
               f"Details: {error}", file=sys.stderr)
         return 1
 

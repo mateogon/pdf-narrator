@@ -344,7 +344,9 @@ class JobService:
         else:
             raise ValueError("Export format must be m4b or mp3.")
         book = self.library.get(book["id"])
-        book["export"] = {"format": export_format, "path": str(path), "created_at": time.time()}
+        # Relative to the book folder, so a moved library keeps working.
+        relative = Path(path).resolve().relative_to(self.library.book_dir(book["id"]))
+        book["export"] = {"format": export_format, "path": relative.as_posix(), "created_at": time.time()}
         self.library.save(book)
         self.log(f"Exported {Path(path).name}", "success")
 
