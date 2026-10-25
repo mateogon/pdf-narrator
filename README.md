@@ -1,33 +1,164 @@
 # PDF Narrator
 
-Convert PDF, EPUB, TXT and HTML books into audiobooks with local [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) speech synthesis. Use the desktop interface or the command line.
+PDF Narrator turns PDF, EPUB, TXT and HTML books into audiobooks. It uses [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), a speech model that runs on your computer. Your books do not go to the internet.
 
-> For a reader with synchronized EPUB text and audio, see [Cadence](https://github.com/mateogon/Cadence).
+![PDF Narrator creating an audiobook](assets/screenshots/create-audio.png)
 
-![Desktop interface](assets/demo.png)
+> For a reader that shows the text while the audio plays, see [Cadence](https://github.com/mateogon/Cadence).
 
-## Install and run
+## Contents
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git, then run:
+1. [Features](#features)
+2. [Requirements](#requirements)
+3. [Install](#install)
+4. [Make an audiobook](#make-an-audiobook)
+5. [Where your files are](#where-your-files-are)
+6. [Command line](#command-line)
+7. [Optional setups](#optional-setups)
+8. [Troubleshooting](#troubleshooting)
+9. [Development](#development)
+10. [License](#license)
 
-```bash
-git clone https://github.com/mateogon/pdf-narrator.git
-cd pdf-narrator
-uv run pdf-narrator
-```
+## Features
 
-uv installs Python 3.12 and the locked dependencies automatically. You do not need to activate a virtual environment. The same commands work in PowerShell, bash, zsh and fish.
+- **Desktop app.** A library of your books and a four-step flow: check the text, pick a voice, create the audio, export.
+- **Local speech.** Kokoro runs on the CPU, on an Apple GPU (MPS) or on an NVIDIA GPU (CUDA). The app selects the fastest one.
+- **Fast.** On an Apple M-series GPU, the app creates audio about 10 to 13 times faster than real time.
+- **Clean text.** The app skips covers, copyright pages, contents and Project Gutenberg license text. You can edit any chapter before you create audio.
+- **54 voices in 9 languages.** You hear each voice read a paragraph from your own book. Each voice shows its quality grade from Kokoro.
+- **Audiobook export.** M4B with chapters, title, author and cover, or one MP3 file for each chapter.
+- **Safe to stop.** You can pause, stop and continue. Finished chapters stay finished. If you edit a chapter, the app creates only that chapter again.
 
-The default installation uses CPU PyTorch wheels on Windows and Linux. On Apple Silicon, PyTorch includes MPS support; the app selects it when available. NVIDIA support is optional below. Java, DeepSpeed, a CUDA Toolkit installation and manual eSpeak installation are not required by the default setup. The English tokenizer is installed with the app; Kokoro downloads its model and selected voices on first synthesis, so that first run needs internet access.
+## Requirements
 
-The desktop app opens in its own window through [pywebview](https://pywebview.flowrl.com/), which uses the system web view: WebKit on macOS and WebView2 on Windows 10/11 (included with the system). On Linux, install WebKitGTK and PyGObject first, for example `sudo apt install gir1.2-webkit2-4.1 python3-gi` on Debian or Ubuntu. The command line can run without a display.
+| Item | Requirement |
+|---|---|
+| Operating system | macOS, Windows 10/11 or Linux |
+| Tools | [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git |
+| Disk space | About 2 GB for Python packages, plus about 350 MB for the speech model |
+| Internet | Only for the first install and the first use of each voice |
+| M4B export (optional) | [FFmpeg](https://ffmpeg.org/download.html) |
+| Scanned PDFs (optional) | Tesseract and Poppler. See [Scanned PDFs](#scanned-pdfs-ocr) |
 
-The app keeps a library of your books in `~/Audiobooks/PDF Narrator` (you can change it in Settings). Each book has its own folder with the extracted text, chapter audio and exports. The original file you import is copied and never modified.
+You do not need to install Python, CUDA, eSpeak, Java or DeepSpeed. uv installs the correct Python version and all packages.
+
+## Install
+
+1. Install uv.
+   - macOS and Linux:
+     ```bash
+     curl -LsSf https://astral.sh/uv/install.sh | sh
+     ```
+   - Windows (PowerShell):
+     ```powershell
+     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+     ```
+2. Linux only: install the system web view and the tools to build its Python bindings (Ubuntu or Debian):
+   ```bash
+   sudo apt install gir1.2-webkit2-4.1 libgirepository-2.0-dev libcairo2-dev pkg-config python3-dev
+   ```
+   On Linux, start the app with `uv run --with "pywebview[gtk]" pdf-narrator` in step 5. macOS and Windows already include a web view.
+   > **Note:** The desktop app is not yet tested on Linux. The command line works without these packages.
+3. Optional: install FFmpeg for M4B export.
+   - macOS: `brew install ffmpeg`
+   - Windows: `winget install Gyan.FFmpeg`
+   - Ubuntu or Debian: `sudo apt install ffmpeg`
+4. Download PDF Narrator.
+   ```bash
+   git clone https://github.com/mateogon/pdf-narrator.git
+   cd pdf-narrator
+   ```
+5. Start the app.
+   ```bash
+   uv run pdf-narrator
+   ```
+
+The first start takes a few minutes, because uv downloads the packages. Later starts take a few seconds.
+
+To update PDF Narrator later, run `git pull` in the `pdf-narrator` folder.
+
+## Make an audiobook
+
+![Library](assets/screenshots/library.png)
+
+### Step 1: Add a book
+
+1. Drag a PDF, EPUB, TXT or HTML file into the window, or click **Choose file**.
+2. Wait a few seconds. The app reads the book and finds its chapters, title, author, cover and language.
+
+To add many books, click **Add a folder**. The app adds all supported files in that folder to the library.
+
+### Step 2: Check the text
+
+![Check the text](assets/screenshots/check-text.png)
+
+1. Look at the chapter list. Sections without a check mark are skipped. The app skips covers, contents, copyright pages and very short sections.
+2. Click a chapter to read its text.
+3. Correct the text if necessary. The app saves your changes automatically.
+4. If the app finds a repeated page header, click **Remove all** to delete it from the chapter.
+5. Click **Continue to voice**.
+
+### Step 3: Pick a voice
+
+![Pick a voice](assets/screenshots/pick-a-voice.png)
+
+1. Make sure that the language is correct. The voices change with the language.
+2. Click the play button on a voice. You hear that voice read a paragraph from your book.
+3. Click a voice card to select it.
+4. Optional: move the **Reading speed** slider.
+5. Click **Create audiobook**.
+
+The first sample takes about 10 seconds, because the app loads the speech model. Later samples are faster.
+
+### Step 4: Create the audio
+
+1. Wait while the app creates each chapter. The page shows the time remaining and the speed.
+2. Optional: click the play button on a finished chapter to listen to it.
+3. To stop for now, click **Pause** or **Stop**. Finished chapters stay finished. Click **Create** again to continue.
+
+> **Note:** The first time, the app downloads the speech model (about 350 MB). This can take a few minutes.
+
+### Step 5: Export
+
+![Export](assets/screenshots/export.png)
+
+1. Select a format:
+   - **Audiobook (M4B):** one file with chapters, title, author and cover. Use it with Apple Books and most audiobook apps. M4B needs FFmpeg.
+   - **MP3 per chapter:** one MP3 file for each chapter. It plays on all devices.
+2. Click **Export audiobook**.
+3. Click **Show file** to open the folder.
+
+The app also has a dark mode. To use it, open **Settings** and select **Dark** or **System**.
+
+![Dark mode](assets/screenshots/dark-mode.png)
+
+## Where your files are
+
+The app keeps a library in `~/Audiobooks/PDF Narrator`. To change this folder, open **Settings > General > Library folder**.
+
+Each book has its own folder:
+
+| Folder or file | Content |
+|---|---|
+| `book.json` | Title, author, language, voice and chapter status |
+| `source/` | A copy of the file that you added. The app does not change your original file |
+| `text/` | The text of each chapter |
+| `chapters/` | The audio of each chapter (WAV) |
+| `export/` | The finished audiobook (M4B or MP3) |
+
+To delete a book, open the book, click **Book details**, then click **Remove from library**. This deletes the library copy only.
 
 ## Command line
 
+You can also make an audiobook without the window:
+
 ```bash
-uv run pdf-narrator book.epub --voice af_heart
+uv run pdf-narrator book.epub --voice af_heart --format m4b
+```
+
+More examples:
+
+```bash
 uv run pdf-narrator book.pdf --voice ef_dora --lang e --output-dir ./audio
 uv run pdf-narrator book.txt --device cpu --format mp3
 uv run pdf-narrator book.epub --format m4b --title "My book" --author "An author"
@@ -35,64 +166,107 @@ uv run pdf-narrator book.epub --resume
 uv run pdf-narrator --help
 ```
 
-With no input argument, `pdf-narrator` opens the desktop app. `uv run pdf-narrator --ui classic` opens the previous Tk window, which needs a Python build with Tk support.
+| Option | Values | Default |
+|---|---|---|
+| `--voice` | A Kokoro voice ID, for example `af_heart`, `bf_emma`, `ef_dora` | `af_heart` |
+| `--lang` | `a` US English, `b` UK English, `e` Spanish, `f` French, `h` Hindi, `i` Italian, `j` Japanese, `p` Brazilian Portuguese, `z` Mandarin | First letter of the voice |
+| `--device` | `auto`, `cpu`, `mps`, `cuda` | `auto` |
+| `--speed` | Reading speed, for example `0.9` or `1.2` | `1.0` |
+| `--format` | `wav`, `mp3`, `m4b` | `wav` |
+| `--resume` | Use chapters that are already finished, if the text, settings and audio did not change | Off |
 
-- Inputs: `.pdf`, `.epub`, `.txt`, `.html`, `.htm`, or a directory of extracted `.txt` chapters.
-- Outputs: WAV by default, MP3, or M4B with chapter markers and EPUB metadata when present.
-- M4B files: the `.m4b` stays in `OUTPUT_DIR`. Intermediate WAV files and resume sidecars stay in `OUTPUT_DIR/chapters/`, including after export. This lets `--resume` reuse them. M4B export requires [FFmpeg](https://ffmpeg.org/download.html) on `PATH`.
-- Device: `auto`, `cpu`, `mps`, or `cuda`. `auto` selects an available accelerator and falls back to CPU.
-- Language: inferred from the voice prefix unless `--lang` is supplied. English voices use `a` or `b`; Spanish voices use `e`. Match the voice to the language.
-- Resume: completed chapters are reused only when the source, settings and audio hashes match. The app writes chapter audio incrementally to limit memory use.
+Rules:
 
-Kokoro also provides French, Hindi, Italian and Brazilian Portuguese voices. Japanese and Mandarin require additional Misaki language dependencies; these are not part of the default installation. See [Kokoro's language documentation](https://github.com/hexgrad/kokoro). Indonesian is not supported by this engine.
+- The voice must match the language. Voices that start with `a` or `b` are English; voices that start with `e` are Spanish.
+- With `--format m4b`, the `.m4b` file goes to the output folder. The chapter WAV files stay in `chapters/` inside that folder, so that `--resume` can use them again.
+- `uv run pdf-narrator --ui classic` opens the previous Tk window. It needs a Python build with Tk.
 
-English extraction expands common abbreviations and numbers. Other languages preserve those forms for the speech engine. PDF header/footer filtering and chapter detection are heuristic; check the extracted text for unusual layouts.
+## Optional setups
 
-After extraction, the app records the current chapter files in `.pdf-narrator-chapters.json`. Preview and generation use that list; older chapters and unrelated files stay on disk. Folders without this manifest use all `.txt` files, including `.TXT`.
+### NVIDIA GPU (Windows and Linux)
 
-The optional `titles` field preserves real chapter titles from the PDF TOC, EPUB TOC or HTML headings. M4B chapter markers use those titles. Older manifests and untitled chapters use `Chapter N`.
+1. Make sure that you have a current NVIDIA driver. You do not need the CUDA Toolkit.
+2. Run the app or the command line with the CUDA packages:
+   ```bash
+   uv run --no-default-groups --extra cuda pdf-narrator
+   ```
+3. Use the same flags each time. Without them, uv installs the CPU packages again.
 
-## NVIDIA acceleration (optional)
+This option is not for macOS. On a Mac, the app uses the Apple GPU (MPS) automatically.
 
-On Windows or Linux with a supported NVIDIA GPU and driver, use the CUDA 12.8 PyTorch wheels:
+### Scanned PDFs (OCR)
 
-```bash
-uv run --no-default-groups --extra cuda pdf-narrator book.epub --device cuda
-```
+A scanned PDF has images of pages, not text. To read it, the app needs optical character recognition (OCR).
 
-Use those uv flags each time you want the CUDA environment. Running the default command selects the CPU dependency group again. The wheels include the CUDA runtime; you do not need to install the CUDA Toolkit. You still need a compatible NVIDIA driver. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/) for driver and GPU compatibility. This option is not for macOS; use MPS there.
+1. Install Tesseract and Poppler:
+   - macOS: `brew install tesseract poppler`
+   - Ubuntu or Debian: `sudo apt install tesseract-ocr poppler-utils`
+   - Windows: install [Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html) and [Poppler](https://pdf2image.readthedocs.io/en/latest/installation.html). Then add their program folders to `PATH`.
+2. Start the app with the OCR packages:
+   ```bash
+   uv run --extra ocr pdf-narrator
+   ```
+3. Check the text in **Check text** before you create the audio. OCR can make mistakes.
 
-## Scanned PDFs (optional OCR)
+OCR uses the default Tesseract language and removes the top and bottom 10% of each page.
 
-Text PDFs work with the default installation. Scanned PDFs require the OCR extra plus system tools:
+### Languages
 
-```bash
-uv run --extra ocr pdf-narrator scanned.pdf
-```
+Kokoro has voices for US and UK English, Spanish, French, Hindi, Italian, Brazilian Portuguese, Japanese and Mandarin. Japanese and Mandarin need extra packages that the default install does not include. See [Kokoro's documentation](https://github.com/hexgrad/kokoro). Kokoro does not support Indonesian.
 
-Install Tesseract and Poppler first, and ensure `tesseract`, `pdftocairo` and `pdfinfo` are on `PATH`:
+For English books, the app changes numbers and abbreviations into words. For other languages, the app keeps them as they are.
 
-- macOS with Homebrew: `brew install tesseract poppler`
-- Ubuntu/Debian: `sudo apt install tesseract-ocr poppler-utils`
-- Windows: install [Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html) and [Poppler](https://pdf2image.readthedocs.io/en/latest/installation.html), then add their executable directories to `PATH`.
+## Troubleshooting
 
-The current OCR path uses Tesseract's default language and crops the top and bottom 10% of each page. Check the extraction before generating a full book.
+| Problem | Cause | What to do |
+|---|---|---|
+| The first sample or the first chapter is slow | The app downloads and loads the speech model | Wait. This occurs only the first time |
+| **Couldn't read** on a book | The file has no text, or the file is damaged | For a scanned PDF, set up [OCR](#scanned-pdfs-ocr). Then click **Try again** |
+| A chapter contains page headers or page numbers | PDF layouts are different from book to book | Edit the text in **Check text**, or click **Remove all** on the suggestion |
+| **Audiobook (M4B)** is not available | FFmpeg is not installed | Install FFmpeg, or export MP3 |
+| The window does not open on Linux | The web view or its Python bindings are missing | Do step 2 of [Install](#install), then start with `uv run --with "pywebview[gtk]" pdf-narrator` |
+| Something else | — | Open **Settings > About > Show diagnostics**, then copy the text into a [GitHub issue](https://github.com/mateogon/pdf-narrator/issues) |
 
-## Development and verification
+To see what the app is doing, click **Activity** at the top right. The **Details** tab shows technical messages.
 
-```bash
-uv sync --locked --group dev
-uv run --group dev pytest -q
-```
+## Development
 
-Dependencies are declared in `pyproject.toml`; `uv.lock` records the resolved versions. There are no separate requirements files per operating system. The `preshed` compatibility pin prevents an English spaCy tokenizer load failure reproduced on macOS; the other native spaCy dependencies do not need old pins.
+1. Install the development packages:
+   ```bash
+   uv sync --locked --group dev
+   ```
+2. Run the tests:
+   ```bash
+   uv run --locked --group dev pytest -q
+   ```
 
-The CI workflow defines CPU tests with Python 3.12 on Ubuntu, Windows and macOS. The runners install FFmpeg; Ubuntu uses Xvfb for native Tk tests. Tests run with Hugging Face offline and do not download Kokoro weights. JUnit results are saved as workflow artifacts. See the [CI runs](https://github.com/mateogon/pdf-narrator/actions/workflows/ci.yml) for current platform results.
+The code has these parts:
 
-The renewal was checked locally on Apple Silicon and on Windows 11 with Python 3.12.12 and an RTX 3050. Windows CPU/CUDA CLI synthesis and the test suite passed. The Windows GUI was constructed through SSH with CUDA visible and enabled; its desktop appearance and interactions were not visually reviewed. CI covers CPU behavior; CUDA and MPS synthesis need separate hardware checks.
+| Part | Files | Job |
+|---|---|---|
+| Text extraction | `extract.py` | Read PDF, EPUB, TXT and HTML; split chapters; clean the text |
+| Speech | `generate_audiobook_kokoro.py` | Send text to Kokoro in paragraph blocks; write audio while it is created |
+| Export | `audiobook_export.py` | Make M4B files with FFmpeg |
+| Library | `library.py`, `voices.py` | Keep books on disk; track the status of each chapter |
+| Jobs | `jobs.py` | Run import, create and export jobs in the background |
+| Desktop app | `webui/` | Window ([pywebview](https://pywebview.flowrl.com/)), local server and interface |
+| Command line | `cli.py` | Make audiobooks without the window |
 
-A separate Ubuntu job installs the OCR extra, Tesseract and Poppler, then extracts text from a generated image-only PDF. Locally, this test skips with a reason if the optional dependencies are absent. To require it, set `REQUIRE_OCR=1` and run `uv run --locked --group dev --extra ocr pytest -q tests/test_ocr_integration.py`. The CI job requires OCR and fails if its tools or English language data are missing.
+Notes:
+
+- `pyproject.toml` declares the dependencies. `uv.lock` records the exact versions.
+- The `preshed` pin prevents a spaCy failure that occurs with newer versions on macOS.
+- The desktop window loads its interface from a local server on `127.0.0.1`. The server uses a random port and a session token, and it only serves files from the library folder.
+- `PDF_NARRATOR_CONFIG_DIR` changes the settings folder. Use it for tests or a portable setup.
+
+### What has been tested
+
+| Platform | Tested |
+|---|---|
+| Ubuntu, Windows, macOS | Automatic tests on CPU in [CI](https://github.com/mateogon/pdf-narrator/actions/workflows/ci.yml), including real OCR on Ubuntu |
+| macOS, Apple M-series | Desktop app from start to export; speech on CPU and MPS |
+| Windows 11, RTX 3050 | Command line on CPU and CUDA. The new desktop app is not yet tested on Windows |
 
 ## License
 
-[MIT](LICENSE.md). Kokoro and its model weights have their own [Apache 2.0 license](https://huggingface.co/hexgrad/Kokoro-82M).
+[MIT](LICENSE.md). Kokoro and its model weights use the [Apache 2.0 license](https://huggingface.co/hexgrad/Kokoro-82M).
