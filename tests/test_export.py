@@ -28,6 +28,18 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(result["author"], "Author")
             self.assertEqual(Path(result["cover_path"]).read_bytes(), b"cover bytes")
 
+    def test_malformed_epub_returns_no_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing_container = root / "nocontainer.epub"
+            with zipfile.ZipFile(missing_container, "w") as archive:
+                archive.writestr("EPUB/book.opf", "<package></package>")
+            self.assertEqual(read_epub_metadata(missing_container, root), {})
+            missing_rootfile = root / "noroot.epub"
+            with zipfile.ZipFile(missing_rootfile, "w") as archive:
+                archive.writestr("META-INF/container.xml", "<container></container>")
+            self.assertEqual(read_epub_metadata(missing_rootfile, root), {})
+
     def test_missing_epub_cover_preserves_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
