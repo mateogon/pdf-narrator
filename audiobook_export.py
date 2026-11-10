@@ -18,21 +18,29 @@ def read_epub_metadata(source, cover_dir):
     result = {}
     if Path(source).suffix.lower() != ".epub":
         return result
-    with zipfile.ZipFile(source) as archive:
-        container = ET.fromstring(archive.read("META-INF/container.xml"))
-        package_path = container.find(".//{*}rootfile").get("full-path")
-        package = ET.fromstring(archive.read(package_path))
-        for field, tag in (("title", "title"), ("author", "creator")):
-            node = package.find(f".//{{*}}{tag}")
-            if node is not None and node.text:
-                result[field] = node.text.strip()
-        cover_id = next((node.get("content") for node in package.findall(".//{*}meta")
-                         if node.get("name") == "cover"), None)
-        items = package.findall(".//{*}manifest/{*}item")
-        cover = next((item for item in items if "cover-image" in item.get("properties", "").split()
-                      or (cover_id and item.get("id") == cover_id)), None)
-        if cover is not None:
-            result.update(_read_cover(archive, package_path, cover, cover_dir))
+    try:
+        with zipfile.ZipFile(source) as archive:
+            container = ET.fromstring(archive.read("META-INF/container.xml"))
+            rootfile = container.find(".//{*}rootfile")
+            if rootfile is None:
+                return result
+            package_path = rootfile.get("full-path")
+            package = ET.fromstring(archive.read(package_path))
+            for field, tag in (("title", "title"), ("author", "creator")):
+                node = package.find(f".//{{*}}{tag}")
+                if node is not None and node.text:
+                    result[field] = node.text.strip()
+            cover_id = next((node.get("content") for node in package.findall(".//{*}meta")
+                             if node.get("name") == "cover"), None)
+            items = package.findall(".//{*}manifest/{*}item")
+            cover = next((item for item in items if "cover-image" in item.get("properties", "").split()
+                          or (cover_id and item.get("id") == cover_id)), None)
+            if cover is not None:
+                result.update(_read_cover(archive, package_path, cover, cover_dir))
+    except (KeyError, AttributeError, ET.ParseError):
+        # A malformed EPUB (missing container, rootfile, or package document)
+        # carries no readable metadata; export falls back to file names.
+        return result
     return result
 
 
